@@ -4,7 +4,7 @@
 
 import { ContractInvokeOptions, DriverFleetStatus, FleetProfile, PendingTreasuryChange } from '../types/common.types';
 import * as FleetManagementTypes from '../types/fleet_management.types';
-import { ContractInvoker, address, u32, u64, vec } from './invoker';
+import { ContractInvoker, address, bool, u32, u64, vec } from './invoker';
 
 /**
  * Maximum roster entries the contract returns for a single `get_fleet_roster`
@@ -34,6 +34,17 @@ export class FleetManagementClient {
   }
 
   /**
+   * Return the identity contract change queued by `setIdentityContract`, or
+   * `null` when no change is pending. Lets operators inspect the pending peer
+   * address and its activation time before calling `confirmIdentityContract`.
+   * Exposes the on-chain `get_pending_identity_contract` query.
+   */
+  async getPendingIdentityContract(options?: ContractInvokeOptions): Promise<FleetManagementTypes.PendingContractAddress | null> {
+    const value = await this.invoker.call('get_pending_identity_contract', [], options);
+    return value == null ? null : decodePendingContractAddress(value, 'get_pending_identity_contract');
+  }
+
+  /**
    * Return the configured identity_reputation_contract address, if any.
    * Returns `null` when no identity contract has been wired to this fleet contract yet.
    * Exposes the on-chain `get_identity_contract` read getter (Issue #486).
@@ -43,12 +54,43 @@ export class FleetManagementClient {
     return result == null ? null : String(result);
   }
 
+  /**
+   * Explicitly enable or disable no-identity mode (admin only).
+   *
+   * By default `add_driver_to_fleet` and `accept_fleet_invite` fail closed
+   * with `IdentityNotConfigured` while no identity contract is configured.
+   * Standalone deployments must opt in with `optional = true`; once an
+   * identity contract is confirmed, registration is always required.
+   */
+  async setIdentityOptional(
+    params: FleetManagementTypes.SetIdentityOptionalParams,
+    options?: ContractInvokeOptions
+  ): Promise<void> {
+    await this.invoker.call('set_identity_optional', [address(params.admin), bool(params.optional)], options);
+  }
+
+  /** `true` when no-identity mode is enabled; `false` by default. */
+  async getIdentityOptional(options?: ContractInvokeOptions): Promise<boolean> {
+    return Boolean(await this.invoker.call('get_identity_optional', [], options));
+  }
+
   async setEscrowContract(params: FleetManagementTypes.SetEscrowContractParams, options?: ContractInvokeOptions): Promise<void> {
     await this.invoker.call('set_escrow_contract', [address(params.admin), address(params.escrowContract)], options);
   }
 
   async confirmEscrowContract(options?: ContractInvokeOptions): Promise<void> {
     await this.invoker.call('confirm_escrow_contract', [], options);
+  }
+
+  /**
+   * Return the escrow contract change queued by `setEscrowContract`, or `null`
+   * when no change is pending. Lets operators verify which escrow address will
+   * become active (and when) before anyone calls `confirmEscrowContract`.
+   * Exposes the on-chain `get_pending_escrow_contract` query.
+   */
+  async getPendingEscrowContract(options?: ContractInvokeOptions): Promise<FleetManagementTypes.PendingContractAddress | null> {
+    const value = await this.invoker.call('get_pending_escrow_contract', [], options);
+    return value == null ? null : decodePendingContractAddress(value, 'get_pending_escrow_contract');
   }
 
   /**
@@ -83,6 +125,20 @@ export class FleetManagementClient {
 
   async acceptFleetOwnerReassignment(fleetId: bigint, newOwner: string, options?: ContractInvokeOptions): Promise<void> {
     await this.invoker.call('accept_fleet_owner_reassignment', [address(newOwner), u64(fleetId)], options);
+  }
+
+  /**
+   * Return the admin-proposed owner reassignment pending for `fleetId`, or
+   * `null` when none is pending. Lets the incoming owner inspect who proposed
+   * the change before calling `acceptFleetOwnerReassignment`.
+   * Exposes the on-chain `get_pending_fleet_owner_reassignment` query.
+   */
+  async getPendingFleetOwnerReassignment(
+    fleetId: bigint,
+    options?: ContractInvokeOptions,
+  ): Promise<FleetManagementTypes.PendingFleetOwnerReassignment | null> {
+    const value = await this.invoker.call('get_pending_fleet_owner_reassignment', [u64(fleetId)], options);
+    return value == null ? null : decodePendingFleetOwnerReassignment(value);
   }
 
   async adminForceUpdateTreasury(params: FleetManagementTypes.AdminForceUpdateTreasuryParams, options?: ContractInvokeOptions): Promise<void> {
@@ -127,6 +183,17 @@ export class FleetManagementClient {
     return result == null ? null : (result as DriverFleetStatus);
   }
 
+  /**
+   * Return the ledger timestamp (seconds) after which the driver's pending
+   * invite can no longer be accepted, or `null` when the driver has no pending
+   * invite. Still returned once the window has elapsed; pair with
+   * `getDriverFleetStatus`, which reports `DriverFleetStatus.Expired` then.
+   */
+  async getInviteExpiry(fleetId: bigint, driver: string, options?: ContractInvokeOptions): Promise<bigint | null> {
+    const result = await this.invoker.call('get_invite_expiry', [u64(fleetId), address(driver)], options);
+    return result == null ? null : BigInt(String(result));
+  }
+
   async getFleetRoster(params: FleetManagementTypes.GetFleetRosterParams, options?: ContractInvokeOptions): Promise<string[]> {
     const offset = params.offset ?? 0;
     const limit = params.limit ?? DEFAULT_ROSTER_PAGE_SIZE;
@@ -136,6 +203,24 @@ export class FleetManagementClient {
       options
     );
     return (result as unknown[]).map((value) => String(value));
+  }
+
+  /**
+   * Renew the storage TTL of one page of a fleet's active roster, extending
+   * each roster slot together with the driver's membership record so the two
+   * never expire independently. Permissionless; changes no state. Returns the
+   * number of roster entries renewed (the window is clamped to the contract's
+   * `MAX_ROSTER_PAGE_SIZE` and the active driver count).
+   */
+  async renewFleetRoster(params: FleetManagementTypes.RenewFleetRosterParams, options?: ContractInvokeOptions): Promise<number> {
+    const offset = params.offset ?? 0;
+    const limit = params.limit ?? DEFAULT_ROSTER_PAGE_SIZE;
+    const result = await this.invoker.call(
+      'renew_fleet_roster',
+      [u64(params.fleetId), u32(offset), u32(limit)],
+      options
+    );
+    return Number(result);
   }
 
   async configureSigners(params: FleetManagementTypes.ConfigureSignersParams, options?: ContractInvokeOptions): Promise<void> {
@@ -168,5 +253,39 @@ function decodePendingTreasury(value: unknown): PendingTreasuryChange {
   return {
     treasury: String(change.treasury),
     activatesAt: Number(change.activates_at),
+  };
+}
+
+/** Read a required field from a decoded contract record, rejecting absent values. */
+function requireField(record: Record<string, unknown>, field: string, source: string): unknown {
+  const value = record[field];
+  if (value === undefined || value === null) {
+    throw new Error(`${source}: malformed record, missing field '${field}'`);
+  }
+  return value;
+}
+
+function asRecord(value: unknown, source: string): Record<string, unknown> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new Error(`${source}: expected a struct record, received ${Array.isArray(value) ? 'array' : typeof value}`);
+  }
+  return value as Record<string, unknown>;
+}
+
+function decodePendingContractAddress(value: unknown, source: string): FleetManagementTypes.PendingContractAddress {
+  const record = asRecord(value, source);
+  return {
+    address: String(requireField(record, 'address', source)),
+    proposedBy: String(requireField(record, 'proposed_by', source)),
+    activatesAt: BigInt(String(requireField(record, 'activates_at', source))),
+  };
+}
+
+function decodePendingFleetOwnerReassignment(value: unknown): FleetManagementTypes.PendingFleetOwnerReassignment {
+  const source = 'get_pending_fleet_owner_reassignment';
+  const record = asRecord(value, source);
+  return {
+    newOwner: String(requireField(record, 'new_owner', source)),
+    admin: String(requireField(record, 'admin', source)),
   };
 }

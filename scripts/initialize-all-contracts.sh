@@ -6,6 +6,19 @@
 set -e
 
 NETWORK=${1:-testnet}
+case "$NETWORK" in
+    testnet|mainnet|futurenet) ;;
+    *)
+        echo "❌ Unsupported network: '$NETWORK'" >&2
+        echo "   Valid networks: testnet, mainnet, futurenet" >&2
+        exit 1
+        ;;
+esac
+# Mode: "init" (default) runs the full initialization + peer-contract
+# proposal flow below. "confirm-peers" instead confirms every timelocked
+# peer-contract pointer that was proposed by an earlier "init" run, once the
+# PEER_CONTRACT_CHANGE_TIMELOCK_SECONDS review period has elapsed.
+MODE=${2:-init}
 # Name of the Stellar CLI identity every deploy/initialize script signs with.
 # Overridable, but the default must match the identity provisioned by
 # .github/workflows/deploy-testnet.yml and documented in docs/DEPLOYMENT.md.
@@ -48,9 +61,34 @@ if ! stellar keys address "$DEPLOYER_IDENTITY" &> /dev/null; then
     exit 1
 fi
 
-# Parse contract IDs from JSON
+# Parse contract IDs from JSON.
+#
+# Previously this grepped "$1": "..." over the whole file, which only
+# happened to work because the manifest's top-level keys (network,
+# deployed_at, deployer_address) never collide with a contract name. That
+# breaks the moment the "contracts" object is nested inside anything else,
+# or a sibling top-level key reuses a contract's name (e.g. a future
+# "previous_contracts" block) - the regex can't tell which object a match
+# came from. Instead, first isolate the body of the top-level "contracts"
+# object (from its opening "{" to its matching closing "}", tracking brace
+# depth) and only look up keys inside that slice.
+CONTRACTS_BLOCK=$(awk '
+    /"contracts"[[:space:]]*:[[:space:]]*\{/ { in_block=1 }
+    in_block {
+        for (i = 1; i <= length($0); i++) {
+            c = substr($0, i, 1)
+            if (c == "{") { depth++; if (depth == 1) next }
+            if (c == "}") {
+                depth--
+                if (depth == 0) { in_block = 0; exit }
+            }
+        }
+        if (in_block) print
+    }
+' "$CONTRACT_IDS_FILE")
+
 get_contract_id() {
-    grep -o "\"$1\": *\"[^\"]*\"" "$CONTRACT_IDS_FILE" | grep -o '"[^"]*"$' | tr -d '"'
+    echo "$CONTRACTS_BLOCK" | grep -o "\"$1\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" | grep -o '"[^"]*"$' | tr -d '"'
 }
 
 ESCROW_ID=$(get_contract_id "escrow_contract")
@@ -88,8 +126,83 @@ invoke_contract() {
         -- "$@"
 }
 
+# Issue #93: every contract's init() panics with AlreadyInitialized on a
+# second call, and this script runs under `set -e`, so a failure partway
+# through (e.g. step 3's init rejected on-chain) previously left no way to
+# resume: re-running from the top would hit AlreadyInitialized on step 1 and
+# abort again before ever reaching the steps that still need to run.
+#
+# is_contract_initialized() probes each contract's own read-only accessor
+# (get_admin on every contract here) to find out, independent of this
+# script's own state, whether that specific contract was already
+# initialized on-chain. init_if_needed() uses that to skip contracts already
+# done and only run init on the ones still pending, so re-running the script
+# after a partial failure resumes instead of erroring or double-initializing.
+is_contract_initialized() {
+    local contract_id=$1
+    stellar contract invoke \
+        --id "$contract_id" \
+        --source "$DEPLOYER_IDENTITY" \
+        --network "$NETWORK" \
+        -- get_admin &> /dev/null
+}
+
+init_if_needed() {
+    local label=$1
+    local contract_id=$2
+    shift 2
+    if is_contract_initialized "$contract_id"; then
+        echo "✓ $label already initialized (resuming — skipped)"
+    else
+        echo "Initializing $label..."
+        invoke_contract "$contract_id" "$@"
+        echo "✓ $label initialized"
+    fi
+}
+
 DISPUTE_TIME_LIMIT=${DISPUTE_TIME_LIMIT:-86400}
 DISPUTE_RESOLUTION_LIMIT=${DISPUTE_RESOLUTION_LIMIT:-86400}
+
+if [ "$MODE" = "confirm-peers" ]; then
+    echo "🔐 Confirming timelocked peer-contract pointers on $NETWORK..."
+    echo ""
+
+    echo "Confirming Delivery Contract's escrow_contract..."
+    invoke_contract "$DELIVERY_ID" confirm_escrow_contract
+    echo "✓ Delivery's escrow_contract confirmed"
+
+    echo "Confirming Dispute Resolution Contract's delivery_contract..."
+    invoke_contract "$DISPUTE_ID" confirm_delivery_contract
+    echo "✓ Dispute resolution's delivery_contract confirmed"
+
+    echo "Confirming Dispute Resolution Contract's escrow_contract..."
+    invoke_contract "$DISPUTE_ID" confirm_escrow_contract
+    echo "✓ Dispute resolution's escrow_contract confirmed"
+
+    echo "Confirming Fleet Management Contract's escrow_contract..."
+    invoke_contract "$FLEET_ID" confirm_escrow_contract
+    echo "✓ Fleet management's escrow_contract confirmed"
+
+    echo "Confirming Fleet Management Contract's identity_contract..."
+    invoke_contract "$FLEET_ID" confirm_identity_contract
+    echo "✓ Fleet management's identity_contract confirmed"
+
+    echo "Confirming Identity Reputation Contract's delivery_contract..."
+    invoke_contract "$IDENTITY_ID" confirm_delivery_contract
+    echo "✓ Identity reputation's delivery_contract confirmed"
+
+    echo "Confirming Settlement Contract's escrow_contract..."
+    invoke_contract "$SETTLEMENT_ID" confirm_escrow_contract
+    echo "✓ Settlement's escrow_contract confirmed"
+
+    echo "Confirming Escrow Contract's delivery_contract..."
+    invoke_contract "$ESCROW_ID" confirm_delivery_contract
+    echo "✓ Escrow's delivery_contract confirmed"
+
+    echo ""
+    echo "✅ All timelocked peer-contract pointers confirmed!"
+    exit 0
+fi
 
 echo "Escrow Contract: $ESCROW_ID"
 echo "Delivery Contract: $DELIVERY_ID"
@@ -99,45 +212,33 @@ echo "Identity Reputation Contract: $IDENTITY_ID"
 echo "Settlement Contract: $SETTLEMENT_ID"
 echo ""
 
-echo "Initializing Escrow Contract..."
-invoke_contract "$ESCROW_ID" init \
+init_if_needed "Escrow Contract" "$ESCROW_ID" init \
     --admin "$ADMIN_ADDRESS" \
     --token "$TOKEN_ADDRESS" \
     --platform_fee_bps "${PLATFORM_FEE_BPS:-250}"
-echo "✓ Escrow initialized"
 
-echo "Initializing Delivery Contract..."
-invoke_contract "$DELIVERY_ID" init \
+init_if_needed "Delivery Contract" "$DELIVERY_ID" init \
     --admin "$ADMIN_ADDRESS" \
     --escrow_contract "$ESCROW_ID"
-echo "✓ Delivery initialized"
 
-echo "Initializing Dispute Resolution Contract..."
-invoke_contract "$DISPUTE_ID" init \
+init_if_needed "Dispute Resolution Contract" "$DISPUTE_ID" init \
     --admin "$ADMIN_ADDRESS" \
     --delivery_contract "$DELIVERY_ID" \
     --escrow_contract "$ESCROW_ID" \
     --dispute_time_limit "$DISPUTE_TIME_LIMIT" \
     --dispute_resolution_limit "$DISPUTE_RESOLUTION_LIMIT"
-echo "✓ Dispute resolution initialized"
 
-echo "Initializing Fleet Management Contract..."
-invoke_contract "$FLEET_ID" init \
+init_if_needed "Fleet Management Contract" "$FLEET_ID" init \
     --admin "$ADMIN_ADDRESS"
-echo "✓ Fleet management initialized"
 
-echo "Initializing Identity Reputation Contract..."
-invoke_contract "$IDENTITY_ID" init \
+init_if_needed "Identity Reputation Contract" "$IDENTITY_ID" init \
     --admin "$ADMIN_ADDRESS" \
     --delivery_contract "$DELIVERY_ID" \
     --dispute_contract "$DISPUTE_ID"
-echo "✓ Identity reputation initialized"
 
-echo "Initializing Settlement Contract..."
-invoke_contract "$SETTLEMENT_ID" init \
+init_if_needed "Settlement Contract" "$SETTLEMENT_ID" init \
     --admin "$ADMIN_ADDRESS" \
     --escrow_contract "$ESCROW_ID"
-echo "✓ Settlement initialized"
 echo ""
 
 echo "Wiring contract integrations..."
@@ -192,7 +293,18 @@ invoke_contract "$ESCROW_ID" set_fleet_management_contract \
     --admin "$ADMIN_ADDRESS" \
     --fleet_contract "$FLEET_ID"
 
-echo "✓ Contract integrations configured"
+echo "✓ Contract integrations configured (proposed, pending timelock)"
+echo ""
+echo "⏳ Several of the peer-contract pointers above (delivery_contract's"
+echo "   escrow_contract, dispute_resolution_contract's delivery_contract and"
+echo "   escrow_contract, identity_reputation_contract's delivery_contract,"
+echo "   fleet_management_contract's escrow_contract and identity_contract,"
+echo "   settlement_contract's escrow_contract, and escrow_contract's"
+echo "   delivery_contract) are timelocked and only take effect once"
+echo "   confirmed after the review period elapses."
+echo ""
+echo "   Once the timelock has elapsed, run:"
+echo "     ./scripts/initialize-all-contracts.sh $NETWORK confirm-peers"
 echo ""
 echo "✅ All contracts initialized successfully!"
 exit 0

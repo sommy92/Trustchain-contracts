@@ -2,7 +2,7 @@
  * Typed SDK client for EscrowContract
  */
 
-import * as EscrowTypes from '../types/escrow.types';
+import * EscrowTypes from '../types/escrow.types';
 import { nativeToScVal } from '@stellar/stellar-sdk';
 import { EscrowRecord, ContractInvokeOptions } from '../types/common.types';
 import { ContractInvoker, address, bool, i128, map, u32, u64, vec } from './invoker';
@@ -53,34 +53,6 @@ export class EscrowClient {
   }
 
   /**
-   * Get the total amount of a token currently locked in escrows
-   */
-  async getTotalLocked(token: string, options?: ContractInvokeOptions): Promise<bigint> {
-    return BigInt(String(await this.invoker.call('get_total_locked', [address(token)], options)));
-  }
-
-  /**
-   * Get the token balance held by the contract but not tracked as escrowed
-   */
-  async getUntrackedBalance(token: string, options?: ContractInvokeOptions): Promise<bigint> {
-    return BigInt(String(await this.invoker.call('get_untracked_balance', [address(token)], options)));
-  }
-
-  /**
-   * Sweep untracked token balance to a recipient (admin only)
-   */
-  async sweepUntrackedBalance(
-    params: EscrowTypes.SweepUntrackedBalanceParams,
-    options?: ContractInvokeOptions
-  ): Promise<bigint> {
-    return BigInt(String(await this.invoker.call(
-      'sweep_untracked_balance',
-      [address(params.admin), address(params.token), address(params.recipient)],
-      options
-    )));
-  }
-
-  /**
    * Set volume thresholds and fee discounts for high-volume senders (admin only)
    */
   async setVolumeTiers(
@@ -115,20 +87,30 @@ export class EscrowClient {
   }
 
   /**
-   * Create a new escrow for a delivery
+   * Create a new escrow for a delivery.
+   *
+   * The on-chain `create_escrow` returns unit, so this method resolves to
+   * `void`. The caller supplies `deliveryId` in `params`; that value is the
+   * escrow identifier used by subsequent operations (release, refund, etc.).
    */
-  async createEscrow(params: EscrowTypes.CreateEscrowParams, options?: ContractInvokeOptions): Promise<bigint> {
-    const result = await this.invoker.call('create_escrow', [address(params.sender), address(params.recipient), address(params.driver), u64(params.deliveryId), address(params.token), i128(params.amount), params.fleetId === undefined ? xdrVoid() : u64(params.fleetId)], options);
-    return BigInt(String(result));
+  async createEscrow(params: EscrowTypes.CreateEscrowParams, options?: ContractInvokeOptions): Promise<void> {
+    await this.invoker.call('create_escrow', [address(params.sender), address(params.recipient), address(params.driver), u64(params.deliveryId), address(params.token), i128(params.amount), params.fleetId === undefined ? xdrVoid() : u64(params.fleetId)], options);
   }
 
   /**
-   * Create multiple escrows in a single transaction
+   * Create multiple escrows in a single transaction.
+   *
+   * Contract signature: `create_escrows_batch(sender, recipient, token, escrow_list)`.
+   * The batch call must pass exactly these four arguments — no per-batch fleetId.
+   *
+   * The on-chain `create_escrows_batch` returns a `u32` count of the escrows
+   * created, so this method resolves to that count (`number`), not a list of
+   * escrow IDs.
    */
   async createEscrowsBatch(
     params: EscrowTypes.CreateEscrowBatchParams,
     options?: ContractInvokeOptions
-  ): Promise<bigint[]> {
+  ): Promise<number> {
     // `create_escrows_batch` takes a `Vec<(u64, Address, i128, Option<u64>)>`,
     // so each entry must be encoded as its own Vec ScVal, not a bare array.
     const entries = params.escrowList.map((entry) =>
@@ -139,8 +121,8 @@ export class EscrowClient {
         entry.fleetId === undefined ? xdrVoid() : u64(entry.fleetId),
       ])
     );
-    const result = await this.invoker.call('create_escrows_batch', [address(params.sender), address(params.recipient), address(params.token), u64(params.fleetId ?? 0), vec(entries)], options);
-    return decodeIds(result);
+    const result = await this.invoker.call('create_escrows_batch', [address(params.sender), address(params.recipient), address(params.token), vec(entries)], options);
+    return Number(result);
   }
 
   /**
@@ -229,6 +211,64 @@ export class EscrowClient {
   }
 
   /**
+   * Read the on-chain protocol version (independent of the crate/SDK version).
+   * See `SUPPORTED_PROTOCOL_VERSION` for the version this SDK targets.
+   */
+  async getProtocolVersion(options?: ContractInvokeOptions): Promise<number> {
+    return Number(await this.invoker.call('get_protocol_version', [], options));
+  }
+
+  /**
+   * Read the protocol slippage tolerance in basis points.
+   */
+  async getSlippageTolerance(options?: ContractInvokeOptions): Promise<number> {
+    return Number(await this.invoker.call('get_slippage_tolerance', [], options));
+  }
+
+  /**
+   * Update the protocol slippage tolerance in basis points (admin only).
+   *
+   * Values outside [0, MAX_SLIPPAGE_TOLERANCE_BPS] or non-integers throw a
+   * `RangeError` locally; the contract reverts with `InvalidSlippageTolerance`
+   * for the same inputs and with `Unauthorized` for a non-admin caller.
+   */
+  async updateSlippageTolerance(
+    params: EscrowTypes.UpdateSlippageToleranceParams,
+    options?: ContractInvokeOptions
+  ): Promise<void> {
+    const bps = params.newSlippageBps;
+    if (!Number.isInteger(bps) || bps < 0 || bps > EscrowTypes.MAX_SLIPPAGE_TOLERANCE_BPS) {
+      throw new RangeError(
+        `slippage tolerance must be an integer within [0, ${EscrowTypes.MAX_SLIPPAGE_TOLERANCE_BPS}] bps, got ${bps}`
+      );
+    }
+    await this.invoker.call('update_slippage_tolerance', [address(params.admin), u32(bps)], options);
+  }
+
+  /**
+   * Set the holdback release delay in seconds (admin only).
+   *
+   * Out-of-range or non-integer values throw a `RangeError` locally; the
+   * contract enforces the same inclusive bounds and reverts with
+   * `InvalidState`. Reverts with `Unauthorized` for a non-admin caller.
+   */
+  async setHoldbackWindow(
+    params: EscrowTypes.SetHoldbackWindowParams,
+    options?: ContractInvokeOptions
+  ): Promise<void> {
+    const windowSeconds = assertHoldbackWindow(params.windowSeconds);
+    await this.invoker.call('set_holdback_window', [address(params.admin), u64(windowSeconds)], options);
+  }
+
+  /**
+   * Read the holdback window currently applied, in seconds. Returns
+   * `DEFAULT_HOLDBACK_WINDOW_SECONDS` when the admin has never set one.
+   */
+  async getHoldbackWindow(options?: ContractInvokeOptions): Promise<bigint> {
+    return BigInt(String(await this.invoker.call('get_holdback_window', [], options)));
+  }
+
+  /**
    * Get an escrow record by delivery ID
    */
   async getEscrow(deliveryId: bigint, options?: ContractInvokeOptions): Promise<EscrowRecord> {
@@ -254,6 +294,28 @@ export class EscrowClient {
    */
   async getEscrowsByDriver(driver: string, options?: ContractInvokeOptions): Promise<bigint[]> {
     return decodeIds(await this.invoker.call('get_escrows_by_driver', [address(driver)], options));
+  }
+
+  /**
+   * Get a page of escrow IDs for `owner`, filtered by role.
+   *
+   * `kind` matches `contracts/escrow_contract/lib.rs::get_escrows_page`'s
+   * discriminant: 0 = sender, 1 = recipient, 2 = driver.
+   */
+  async getEscrowsPage(
+    owner: string,
+    kind: EscrowTypes.EscrowPartyKind,
+    offset: number,
+    limit: number,
+    options?: ContractInvokeOptions
+  ): Promise<bigint[]> {
+    return decodeIds(
+      await this.invoker.call(
+        'get_escrows_page',
+        [address(owner), u32(kind), u32(offset), u32(limit)],
+        options
+      )
+    );
   }
 
   /**
@@ -295,6 +357,43 @@ export class EscrowClient {
       options
     );
     return BigInt(String(result));
+  }
+
+  /**
+   * Freeze an escrow's funds on behalf of the dispute resolution contract.
+   *
+   * Role check: `params.caller` must be the configured
+   * `dispute_resolution_contract` (`Unauthorized` otherwise; `NotInitialized`
+   * if none is configured). Incident responders should use
+   * {@link EscrowClient.adminFreezeFunds} instead.
+   *
+   * Moves a `Locked` or `Holdback` escrow to `Paused`; never transfers funds.
+   * Already-`Paused` escrows are a no-op, terminal escrows (`Released`,
+   * `Refunded`, `Split`) reject with `InvalidState`. Works while the protocol
+   * is paused.
+   */
+  async freezeFunds(params: EscrowTypes.FreezeFundsParams, options?: ContractInvokeOptions): Promise<void> {
+    await this.invoker.call('freeze_funds', [address(params.caller), u64(params.deliveryId)], options);
+  }
+
+  /**
+   * Emergency freeze of an escrow by the protocol admin.
+   *
+   * Role check: `params.admin` must sign and match the stored admin
+   * (`Unauthorized` otherwise). Same state rules as
+   * {@link EscrowClient.freezeFunds}, is not blocked by a protocol pause, and
+   * also syncs the delivery record to `Disputed` when a delivery contract is
+   * configured.
+   *
+   * Recovery: a frozen escrow is settled through the dispute path —
+   * {@link EscrowClient.resolveDispute} or
+   * {@link EscrowClient.resolveDisputeSplit}.
+   */
+  async adminFreezeFunds(
+    params: EscrowTypes.AdminFreezeFundsParams,
+    options?: ContractInvokeOptions
+  ): Promise<void> {
+    await this.invoker.call('admin_freeze_funds', [address(params.admin), u64(params.deliveryId)], options);
   }
 
   /**
@@ -349,6 +448,57 @@ export class EscrowClient {
   }
 
   /**
+   * Get the active delivery peer contract address. `null` means delivery
+   * verification is disabled.
+   */
+  async getDeliveryContract(options?: ContractInvokeOptions): Promise<string | null> {
+    return decodeOptionalAddress(await this.invoker.call('get_delivery_contract', [], options));
+  }
+
+  /**
+   * Get the in-flight delivery contract rotation, or `null` when none is pending.
+   */
+  async getPendingDeliveryContract(
+    options?: ContractInvokeOptions
+  ): Promise<EscrowTypes.PendingDeliveryContractInfo | null> {
+    const raw = await this.invoker.call('get_pending_delivery_contract', [], options);
+    if (raw === null || raw === undefined) return null;
+    const record = raw as Record<string, unknown>;
+    return {
+      deliveryContract: String(record.address),
+      proposedBy: String(record.proposed_by),
+      activatesAt: BigInt(String(record.activates_at)),
+    };
+  }
+
+  /**
+   * Propose rotating the delivery peer contract (admin only).
+   *
+   * The change does not take effect immediately: it is stored as pending and
+   * only becomes active after the peer-contract timelock elapses and
+   * {@link EscrowClient.confirmDeliveryContract} is called. A new proposal
+   * replaces any existing pending one and restarts the timelock.
+   */
+  async proposeDeliveryContract(
+    params: EscrowTypes.ProposeDeliveryContractParams,
+    options?: ContractInvokeOptions
+  ): Promise<void> {
+    await this.invoker.call('set_delivery_contract', [address(params.admin), address(params.deliveryContract)], options);
+  }
+
+  /**
+   * Activate the pending delivery contract rotation.
+   *
+   * Permissionless once the timelock has elapsed. The contract rejects the call
+   * with `NoPendingContractChange` when nothing is pending, and with
+   * `ContractChangeTimelockNotElapsed` before `activatesAt`; in both cases the
+   * active delivery contract is left unchanged.
+   */
+  async confirmDeliveryContract(options?: ContractInvokeOptions): Promise<void> {
+    await this.invoker.call('confirm_delivery_contract', [], options);
+  }
+
+  /**
    * Get the fleet management contract address
    */
   async getFleetManagementContract(options?: ContractInvokeOptions): Promise<string | null> {
@@ -366,6 +516,42 @@ export class EscrowClient {
   }
 
   /**
+   * Nominate a new admin (step 1 of the two-party handover).
+   *
+   * Requires `currentAdmin` to sign and to match the stored admin, otherwise
+   * the contract rejects with `Unauthorized`. The stored admin is NOT changed
+   * until the nominee calls {@link EscrowClient.acceptAdmin}; a new proposal
+   * replaces any existing one.
+   */
+  async proposeAdmin(params: EscrowTypes.ProposeEscrowAdminParams, options?: ContractInvokeOptions): Promise<void> {
+    await this.invoker.call('propose_admin', [address(params.currentAdmin), address(params.newAdmin)], options);
+  }
+
+  /**
+   * Withdraw a pending admin nomination. Current admin only.
+   *
+   * Rejects with `InvalidState` when no proposal is pending and with
+   * `Unauthorized` when `currentAdmin` is not the stored admin.
+   */
+  async cancelAdminProposal(
+    params: EscrowTypes.CancelEscrowAdminProposalParams,
+    options?: ContractInvokeOptions
+  ): Promise<void> {
+    await this.invoker.call('cancel_admin_proposal', [address(params.currentAdmin)], options);
+  }
+
+  /**
+   * Accept a pending admin nomination (step 2 of the two-party handover).
+   *
+   * Requires `newAdmin` to sign and to equal the pending nominee, otherwise
+   * the contract rejects with `Unauthorized` (`InvalidState` when nothing is
+   * pending). On success the stored admin is replaced and the proposal cleared.
+   */
+  async acceptAdmin(params: EscrowTypes.AcceptEscrowAdminParams, options?: ContractInvokeOptions): Promise<void> {
+    await this.invoker.call('accept_admin', [address(params.newAdmin)], options);
+  }
+
+  /**
    * Check if the protocol is paused
    */
   async isPaused(options?: ContractInvokeOptions): Promise<boolean> {
@@ -380,6 +566,22 @@ export class EscrowClient {
   }
 }
 
+function assertHoldbackWindow(value: bigint | number): bigint {
+  if (typeof value === 'number' && !Number.isInteger(value)) {
+    throw new RangeError(`holdback window must be an integer number of seconds, got ${value}`);
+  }
+  const seconds = BigInt(value);
+  if (
+    seconds < EscrowTypes.MIN_HOLDBACK_WINDOW_SECONDS ||
+    seconds > EscrowTypes.MAX_HOLDBACK_WINDOW_SECONDS
+  ) {
+    throw new RangeError(
+      `holdback window must be within [${EscrowTypes.MIN_HOLDBACK_WINDOW_SECONDS}, ${EscrowTypes.MAX_HOLDBACK_WINDOW_SECONDS}] seconds, got ${seconds}`
+    );
+  }
+  return seconds;
+}
+
 function xdrVoid() {
   return nativeToScVal(null);
 }
@@ -392,16 +594,4 @@ function decodeOptionalAddress(value: unknown): string | null {
   return value === null || value === undefined ? null : String(value);
 }
 
-function decodeEscrow(value: unknown): EscrowRecord {
-  const record = value as Record<string, unknown>;
-  return {
-    sender: String(record.sender), recipient: String(record.recipient), driver: String(record.driver),
-    token: String(record.token), amount: BigInt(String(record.amount)), status: record.status as EscrowRecord['status'],
-    createdAt: Number(record.created_at), expiresAt: record.expires_at === null ? undefined : Number(record.expires_at),
-    disputedBy: record.disputed_by === null ? undefined : String(record.disputed_by),
-    disputedAt: record.disputed_at === null ? undefined : Number(record.disputed_at),
-    fleetId: record.fleet_id === null || record.fleet_id === undefined ? undefined : BigInt(String(record.fleet_id)),
-    deliveryId: Number(record.delivery_id ?? 0),
-    holdbackStartedAt: record.holdback_started_at === null ? undefined : Number(record.holdback_started_at),
-  };
-}
+/* … truncated 252 chars — edit only what you need near the top … */

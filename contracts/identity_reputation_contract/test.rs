@@ -2,7 +2,7 @@ use super::*;
 use proptest::prelude::*;
 use shared_types::TrustchainError;
 use soroban_sdk::{
-    testutils::{Address as _, Events, Ledger as _},
+    testutils::{storage::Persistent as _, Address as _, Events, Ledger as _},
     xdr, Address, Env, Symbol, TryFromVal, Val,
 };
 
@@ -231,7 +231,7 @@ fn test_decrease_reputation_basic() {
     let driver = Address::generate(&env);
     client.register_driver(&driver);
 
-    client.decrease_reputation(&delivery_contract, &driver, &10u32);
+    client.decrease_reputation(&delivery_contract, &driver, &1u64, &10u32, &None);
     let profile = client.get_driver_profile(&driver);
     assert_eq!(profile.reputation_score, 40);
 }
@@ -242,7 +242,7 @@ fn test_reputation_cannot_go_below_zero() {
     let driver = Address::generate(&env);
     client.register_driver(&driver);
 
-    client.decrease_reputation(&delivery_contract, &driver, &200u32);
+    client.decrease_reputation(&delivery_contract, &driver, &1u64, &200u32, &None);
     let profile = client.get_driver_profile(&driver);
     assert_eq!(profile.reputation_score, 0);
 }
@@ -267,7 +267,7 @@ fn test_tier_bronze() {
     client.register_driver(&driver);
 
     client.increase_reputation(&delivery_contract, &driver, &1u64, &1000u32, &false);
-    client.decrease_reputation(&delivery_contract, &driver, &15u32);
+    client.decrease_reputation(&delivery_contract, &driver, &1u64, &15u32, &None);
     let tier = client.get_driver_tier(&driver);
     assert_eq!(tier, DriverTier::Bronze);
 }
@@ -331,10 +331,10 @@ fn drive_score_to(
             score += 5;
         }
         if score > target {
-            client.decrease_reputation(authorized, driver, &(score - target));
+            client.decrease_reputation(authorized, driver, &0u64, &(score - target), &None);
         }
     } else {
-        client.decrease_reputation(authorized, driver, &(start - target));
+        client.decrease_reputation(authorized, driver, &0u64, &(start - target), &None);
     }
     assert_eq!(
         client.get_driver_profile(driver).reputation_score,
@@ -449,9 +449,9 @@ fn test_reputation_deduction_sequence() {
     client.register_driver(&driver);
 
     client.increase_reputation(&delivery_contract, &driver, &1u64, &6000u32, &true);
-    client.decrease_reputation(&dispute_contract, &driver, &3u32);
+    client.decrease_reputation(&dispute_contract, &driver, &1u64, &3u32, &None);
     client.increase_reputation(&delivery_contract, &driver, &2u64, &1000u32, &false);
-    client.decrease_reputation(&dispute_contract, &driver, &7u32);
+    client.decrease_reputation(&dispute_contract, &driver, &2u64, &7u32, &None);
 
     let profile = client.get_driver_profile(&driver);
     assert_eq!(profile.reputation_score, 55);
@@ -576,7 +576,7 @@ fn test_admin_can_repoint_cross_contracts() {
     assert_eq!(client.get_dispute_contract(), new_dispute_contract);
 
     client.increase_reputation(&new_delivery_contract, &driver, &1u64, &1000u32, &false);
-    client.decrease_reputation(&new_dispute_contract, &driver, &2u32);
+    client.decrease_reputation(&new_dispute_contract, &driver, &1u64, &2u32, &None);
 
     let profile = client.get_driver_profile(&driver);
     assert_eq!(profile.reputation_score, 53);
@@ -673,13 +673,14 @@ fn test_authorized_third_contract_can_update_reputation() {
     let profile = client.get_driver_profile(&driver);
     assert_eq!(profile.reputation_score, 55);
 
-    client.decrease_reputation(&third_contract, &driver, &5u32);
+    client.decrease_reputation(&third_contract, &driver, &1u64, &5u32, &None);
     let profile = client.get_driver_profile(&driver);
     assert_eq!(profile.reputation_score, 50);
 }
 
-/// set_authorized_contract(false) revokes a previously-authorized caller; any
-/// subsequent reputation call from that address must be rejected.
+/// Confirming a delivery peer rotation revokes the superseded caller; any
+/// subsequent reputation call from that address must be rejected without any
+/// manual allowlist bookkeeping.
 #[test]
 fn test_deauthorized_caller_is_rejected() {
     let (env, admin, client, delivery_id, _) = setup_wired();
@@ -687,23 +688,138 @@ fn test_deauthorized_caller_is_rejected() {
     client.register_driver(&driver);
 
     // Repoint to a real replacement delivery contract (the pause guard
-    // resolves through the stored delivery address), then de-authorize the
-    // superseded original.
+    // resolves through the stored delivery address). Confirmation must revoke
+    // the superseded original automatically.
     let new_delivery_contract = new_delivery_contract_on_same_escrow(&env, &admin, &delivery_id);
     client.set_delivery_contract(&admin, &new_delivery_contract);
     env.ledger().set_timestamp(
         env.ledger().timestamp() + shared_types::PEER_CONTRACT_CHANGE_TIMELOCK_SECONDS,
     );
     client.confirm_delivery_contract();
-    // Repointing alone doesn't revoke the old address — the allowlist is
-    // managed explicitly, so the supersession must be done here too.
-    client.set_authorized_contract(&admin, &delivery_id, &false);
+
+    assert!(client.is_authorized_contract(&new_delivery_contract));
+    assert!(!client.is_authorized_contract(&delivery_id));
 
     let result = client.try_increase_reputation(&delivery_id, &driver, &1u64, &1000u32, &false);
     match result {
         Err(Ok(err)) => assert_eq!(err, TrustchainError::Unauthorized.into()),
         _ => panic!("Expected the superseded delivery contract to fail with Unauthorized"),
     }
+}
+
+// ── Issue #117: peer rotation keeps authorization in sync ───────────────────
+
+/// Rotating the delivery peer must atomically move the AuthorizedContract
+/// flag: the new peer is authorized for increase/decrease/award, the retired
+/// peer is rejected with `Unauthorized` on all three.
+#[test]
+fn test_delivery_rotation_moves_authorization() {
+    let (env, admin, client, old_delivery, _) = setup_wired();
+    let driver = Address::generate(&env);
+    client.register_driver(&driver);
+
+    let new_delivery = new_delivery_contract_on_same_escrow(&env, &admin, &old_delivery);
+    client.set_delivery_contract(&admin, &new_delivery);
+    env.ledger().set_timestamp(
+        env.ledger().timestamp() + shared_types::PEER_CONTRACT_CHANGE_TIMELOCK_SECONDS,
+    );
+    client.confirm_delivery_contract();
+
+    // Allowlist agrees with the active peer address.
+    assert!(client.is_authorized_contract(&new_delivery));
+    assert!(!client.is_authorized_contract(&old_delivery));
+
+    // New peer can drive every reputation entry point.
+    client.increase_reputation(&new_delivery, &driver, &1u64, &1000u32, &false);
+    client.decrease_reputation(&new_delivery, &driver, &2u32);
+    client.award_reputation(&new_delivery, &driver, &3u32);
+    assert_eq!(client.get_driver_profile(&driver).reputation_score, 56);
+
+    // Retired peer is rejected on every reputation entry point.
+    let inc = client.try_increase_reputation(&old_delivery, &driver, &2u64, &1000u32, &false);
+    match inc {
+        Err(Ok(err)) => assert_eq!(err, TrustchainError::Unauthorized.into()),
+        _ => panic!("Expected retired delivery peer to fail increase_reputation"),
+    }
+    let dec = client.try_decrease_reputation(&old_delivery, &driver, &5u32);
+    match dec {
+        Err(Ok(err)) => assert_eq!(err, TrustchainError::Unauthorized.into()),
+        _ => panic!("Expected retired delivery peer to fail decrease_reputation"),
+    }
+    let award = client.try_award_reputation(&old_delivery, &driver, &5u32);
+    match award {
+        Err(Ok(err)) => assert_eq!(err, TrustchainError::Unauthorized.into()),
+        _ => panic!("Expected retired delivery peer to fail award_reputation"),
+    }
+}
+
+/// Rotating the dispute peer must likewise move the AuthorizedContract flag:
+/// the new peer is authorized for increase/decrease/award, the retired peer is
+/// rejected with `Unauthorized` on all three.
+#[test]
+fn test_dispute_rotation_moves_authorization() {
+    let (env, admin, client, _, old_dispute) = setup_wired();
+    let driver = Address::generate(&env);
+    client.register_driver(&driver);
+
+    let new_dispute = Address::generate(&env);
+    client.set_dispute_contract(&admin, &new_dispute);
+
+    // Allowlist agrees with the active peer address.
+    assert!(client.is_authorized_contract(&new_dispute));
+    assert!(!client.is_authorized_contract(&old_dispute));
+
+    // New peer can drive every reputation entry point.
+    client.increase_reputation(&new_dispute, &driver, &1u64, &1000u32, &false);
+    client.decrease_reputation(&new_dispute, &driver, &2u32);
+    client.award_reputation(&new_dispute, &driver, &3u32);
+    assert_eq!(client.get_driver_profile(&driver).reputation_score, 56);
+
+    // Retired peer is rejected on every reputation entry point.
+    let inc = client.try_increase_reputation(&old_dispute, &driver, &2u64, &1000u32, &false);
+    match inc {
+        Err(Ok(err)) => assert_eq!(err, TrustchainError::Unauthorized.into()),
+        _ => panic!("Expected retired dispute peer to fail increase_reputation"),
+    }
+    let dec = client.try_decrease_reputation(&old_dispute, &driver, &5u32);
+    match dec {
+        Err(Ok(err)) => assert_eq!(err, TrustchainError::Unauthorized.into()),
+        _ => panic!("Expected retired dispute peer to fail decrease_reputation"),
+    }
+    let award = client.try_award_reputation(&old_dispute, &driver, &5u32);
+    match award {
+        Err(Ok(err)) => assert_eq!(err, TrustchainError::Unauthorized.into()),
+        _ => panic!("Expected retired dispute peer to fail award_reputation"),
+    }
+}
+
+/// A pending delivery proposal that has not been confirmed must not touch the
+/// allowlist: the current peer stays authorized and the proposed peer stays
+/// unauthorized until `confirm_delivery_contract` runs.
+#[test]
+fn test_pending_delivery_proposal_does_not_change_authorization() {
+    let (env, admin, client, old_delivery, _) = setup_wired();
+    let driver = Address::generate(&env);
+    client.register_driver(&driver);
+
+    let new_delivery = new_delivery_contract_on_same_escrow(&env, &admin, &old_delivery);
+    client.set_delivery_contract(&admin, &new_delivery);
+
+    // Proposal alone leaves the allowlist untouched.
+    assert!(client.is_authorized_contract(&old_delivery));
+    assert!(!client.is_authorized_contract(&new_delivery));
+
+    // The proposed peer cannot write reputation yet.
+    let result =
+        client.try_increase_reputation(&new_delivery, &driver, &1u64, &1000u32, &false);
+    match result {
+        Err(Ok(err)) => assert_eq!(err, TrustchainError::Unauthorized.into()),
+        _ => panic!("Expected unconfirmed delivery peer to fail with Unauthorized"),
+    }
+
+    // The still-active peer keeps working.
+    client.increase_reputation(&old_delivery, &driver, &1u64, &1000u32, &false);
+    assert_eq!(client.get_driver_profile(&driver).reputation_score, 55);
 }
 
 #[test]
@@ -746,7 +862,8 @@ fn test_deauthorized_delivery_contract_rejected_for_reputation_calls() {
         _ => panic!("Expected de-authorized increase_reputation to fail with Unauthorized"),
     }
 
-    let dec_result = client.try_decrease_reputation(&delivery_contract, &driver, &5u32);
+    let dec_result =
+        client.try_decrease_reputation(&delivery_contract, &driver, &1u64, &5u32, &None);
     match dec_result {
         Err(Ok(err)) => assert_eq!(err, TrustchainError::Unauthorized.into()),
         _ => panic!("Expected de-authorized decrease_reputation to fail with Unauthorized"),
@@ -790,7 +907,7 @@ fn test_unauthorized_caller_cannot_decrease_reputation() {
     let driver = Address::generate(&env);
     client.register_driver(&driver);
 
-    let result = client.try_decrease_reputation(&random, &driver, &5u32);
+    let result = client.try_decrease_reputation(&random, &driver, &1u64, &5u32, &None);
     match result {
         Err(Ok(err)) => assert_eq!(err, TrustchainError::Unauthorized.into()),
         _ => panic!("Expected unauthorized decrease_reputation to fail with Unauthorized"),
@@ -1227,7 +1344,7 @@ fn test_suspended_driver_still_receives_penalties() {
     client.register_driver(&driver);
     client.suspend_driver(&admin, &driver);
 
-    client.decrease_reputation(&dispute_contract, &driver, &10u32);
+    client.decrease_reputation(&dispute_contract, &driver, &1u64, &10u32, &None);
     assert_eq!(client.get_driver_profile(&driver).reputation_score, 40);
 }
 
@@ -1286,7 +1403,7 @@ fn test_existing_flows_unaffected_for_active_drivers() {
     client.register_driver(&driver);
     client.update_driver_kyc_status(&admin, &driver, &true);
     client.increase_reputation(&delivery_contract, &driver, &1u64, &6000u32, &true);
-    client.decrease_reputation(&dispute_contract, &driver, &3u32);
+    client.decrease_reputation(&dispute_contract, &driver, &1u64, &3u32, &None);
 
     let profile = client.get_driver_profile(&driver);
     assert_eq!(profile.kyc_verified, true);
@@ -1429,4 +1546,93 @@ fn test_register_driver_emits_event_with_kyc_and_score() {
     let profile = client.get_driver_profile(&driver);
     assert!(!profile.kyc_verified);
     assert_eq!(profile.reputation_score, INITIAL_REPUTATION_SCORE);
+}
+
+// ── Driver profile archival recovery ─────────────────────────────────────────
+
+fn driver_profile_ttl(env: &Env, client: &IdentityReputationContractClient, driver: &Address) -> u32 {
+    env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .get_ttl(&DataKey::DriverProfile(driver.clone()))
+    })
+}
+
+/// Advance far enough that the remaining TTL drops below the extension
+/// threshold, so any `extend_ttl` call is observable.
+fn age_past_ttl_threshold(env: &Env) {
+    env.ledger().with_mut(|l| {
+        l.sequence_number += ttl::LEDGER_TTL_EXTEND_TO - ttl::LEDGER_TTL_THRESHOLD + 1;
+    });
+}
+
+#[test]
+fn test_driver_profile_reads_do_not_extend_ttl() {
+    let (env, _admin, client, _, _) = setup();
+    let driver = Address::generate(&env);
+    client.register_driver(&driver);
+    age_past_ttl_threshold(&env);
+    let before = driver_profile_ttl(&env, &client, &driver);
+
+    assert!(client.has_driver_profile(&driver));
+    client.get_driver_profile(&driver);
+    assert!(!client.is_driver_suspended(&driver));
+
+    assert_eq!(driver_profile_ttl(&env, &client, &driver), before);
+}
+
+#[test]
+fn test_register_driver_for_returning_driver_extends_ttl_and_keeps_history() {
+    let (env, admin, client, _, _) = setup();
+    let driver = Address::generate(&env);
+    client.register_driver(&driver);
+    client.update_driver_kyc_status(&admin, &driver, &true);
+    client.suspend_driver(&admin, &driver);
+    age_past_ttl_threshold(&env);
+    assert!(driver_profile_ttl(&env, &client, &driver) < ttl::LEDGER_TTL_THRESHOLD);
+
+    let profile = client.register_driver(&driver);
+
+    assert_eq!(driver_profile_ttl(&env, &client, &driver), ttl::LEDGER_TTL_EXTEND_TO);
+    // Re-registration must still not reset history or lift the suspension.
+    assert!(profile.kyc_verified);
+    assert_eq!(profile.status, DriverStatus::Suspended);
+    assert_eq!(client.get_driver_profile(&driver), profile);
+}
+
+#[test]
+fn test_extend_driver_profile_ttl_refreshes_existing_profile() {
+    let (env, _admin, client, _, _) = setup();
+    let driver = Address::generate(&env);
+    let registered = client.register_driver(&driver);
+    age_past_ttl_threshold(&env);
+
+    let profile = client.extend_driver_profile_ttl(&driver);
+
+    assert_eq!(profile, registered);
+    assert_eq!(driver_profile_ttl(&env, &client, &driver), ttl::LEDGER_TTL_EXTEND_TO);
+}
+
+#[test]
+fn test_extend_driver_profile_ttl_needs_no_authorization() {
+    let env = Env::default();
+    let contract_id = env.register(IdentityReputationContract, ());
+    let client = IdentityReputationContractClient::new(&env, &contract_id);
+    let driver = Address::generate(&env);
+    env.mock_all_auths();
+    client.register_driver(&driver);
+    env.set_auths(&[]);
+
+    client.extend_driver_profile_ttl(&driver);
+    assert!(env.auths().is_empty());
+}
+
+#[test]
+fn test_extend_driver_profile_ttl_rejects_unregistered_driver() {
+    let (env, _admin, client, _, _) = setup();
+    let result = client.try_extend_driver_profile_ttl(&Address::generate(&env));
+    match result {
+        Err(Ok(err)) => assert_eq!(err, TrustchainError::ProviderNotFound.into()),
+        _ => panic!("Expected TrustchainError::ProviderNotFound"),
+    }
 }

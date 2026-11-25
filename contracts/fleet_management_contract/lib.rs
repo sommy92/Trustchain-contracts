@@ -1,10 +1,10 @@
 #![no_std]
 
 use shared_types::{
-    events, is_admin, ttl, DriverInvitedEvent, DriverProfile, DriverRemovedEvent,
+    events, is_admin, ttl, DriverInvitedEvent, DriverProfile, DriverRemovedEvent, DriverStatus,
     FleetDeactivatedEvent, FleetOwnerReassignedEvent, FleetReactivatedEvent, FleetRegisteredEvent,
     FleetTreasuryChangeProposedEvent, FleetTreasuryForceUpdatedEvent, FleetTreasuryUpdatedEvent,
-    TrustchainError, InviteAcceptedEvent, PayoutRoutingFallbackEvent, StorageKey,
+    TrustchainError, InviteAcceptedEvent, StorageKey,
 };
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, Address, Env, IntoVal,
@@ -38,6 +38,108 @@ pub const MAX_SIGNERS_PER_FLEET: u32 = 20;
 pub const TREASURY_CHANGE_TIMELOCK_SECONDS: u64 = 3 * 24 * 60 * 60; // 3 days
 pub const PEER_CONTRACT_CHANGE_TIMELOCK_SECONDS: u64 = 3 * 24 * 60 * 60; // 3 days
 
+/// How long a driver has to accept a fleet invitation, measured from the
+/// ledger timestamp at which `add_driver_to_fleet` issued it. Once elapsed,
+/// `accept_fleet_invite` fails with `FleetError::InviteExpired` and
+/// `get_driver_fleet_status` reports `DriverFleetStatus::Expired`.
+pub const INVITE_ACCEPTANCE_WINDOW_SECONDS: u64 = 7 * 24 * 60 * 60; // 7 days
+
+// The invite records are extended to `LEDGER_TTL_EXTEND_TO` ledgers when
+// issued. Even assuming an (unrealistically fast) one-second ledger close
+// time, that outlives the acceptance window, so an invite can never be
+// archived while it is still acceptable.
+const _: () = assert!(INVITE_ACCEPTANCE_WINDOW_SECONDS < ttl::LEDGER_TTL_EXTEND_TO as u64);
+
+/// Renew the TTL of contract-wide state that every fleet operation depends on:
+/// the contract instance and the persistent `DataKey::FleetCounter`.
+///
+/// The fleet counter is a single persistent entry that is only *written* by
+/// `register_fleet`. Overwriting an existing persistent entry does not extend
+/// its TTL, so before this helper existed the counter kept the minimum TTL it
+/// received in `init` and could be archived during a quiet period with no new
+/// fleet registrations — even while existing fleets were busy. Every
+/// subsequent `register_fleet` would then fail until someone restored the
+/// entry. Renewing it alongside the instance on every state-changing fleet
+/// operation ties the counter's lifetime to protocol activity rather than to
+/// fleet-creation activity.
+///
+/// Recovery policy: if the counter is nonetheless archived (e.g. the whole
+/// contract went quiet for longer than `ttl::LEDGER_TTL_EXTEND_TO` ledgers),
+/// it is *not* lost — persistent entries are archived, never deleted. It must
+/// be restored (a `RestoreFootprint` operation, or automatic restoration of
+/// archived entries in the transaction footprint) before the next
+/// `register_fleet`; the contract never re-seeds the counter from zero,
+/// because that would re-issue existing fleet ids.
+fn renew_contract_state(env: &Env) {
+    env.storage()
+        .instance()
+        .extend_ttl(ttl::LEDGER_TTL_THRESHOLD, ttl::LEDGER_TTL_EXTEND_TO);
+    let counter_key = DataKey::FleetCounter;
+    if env.storage().persistent().has(&counter_key) {
+        env.storage().persistent().extend_ttl(
+            &counter_key,
+            ttl::LEDGER_TTL_THRESHOLD,
+            ttl::LEDGER_TTL_EXTEND_TO,
+        );
+    }
+}
+
+/// Renew the two persistent records that together describe one active fleet
+/// member: the `DriverFleet(fleet_id, driver)` membership status and the
+/// `FleetRoster(fleet_id, index)` slot that lists the driver in the roster.
+///
+/// The two records are separate ledger entries with independent TTLs. If one
+/// is renewed without the other they drift apart, and the shorter-lived one
+/// can be archived first — a lapsed slot makes `get_fleet_roster` pagination
+/// incomplete and `remove_driver_from_fleet` compaction fail with
+/// `InternalStorageError`, while a lapsed membership record silently changes
+/// payout routing. Every path that renews one of them for an active member
+/// goes through this helper so both always share the same lifetime.
+fn renew_active_membership(env: &Env, fleet_id: u64, driver: &Address, index: u32) {
+    let membership_key = DataKey::DriverFleet(fleet_id, driver.clone());
+    env.storage().persistent().extend_ttl(
+        &membership_key,
+        ttl::LEDGER_TTL_THRESHOLD,
+        ttl::LEDGER_TTL_EXTEND_TO,
+    );
+    let slot_key = DataKey::FleetRoster(fleet_id, index);
+    env.storage().persistent().extend_ttl(
+        &slot_key,
+        ttl::LEDGER_TTL_THRESHOLD,
+        ttl::LEDGER_TTL_EXTEND_TO,
+    );
+}
+
+/// Extend the TTL of a pending invite's status and expiry records together.
+fn renew_pending_invite(env: &Env, fleet_id: u64, driver: &Address) {
+    for key in [
+        DataKey::DriverFleet(fleet_id, driver.clone()),
+        DataKey::InviteExpiry(fleet_id, driver.clone()),
+    ] {
+        env.storage().persistent().extend_ttl(
+            &key,
+            ttl::LEDGER_TTL_THRESHOLD,
+            ttl::LEDGER_TTL_EXTEND_TO,
+        );
+    }
+}
+
+/// Whether a `Pending` invite's acceptance window has elapsed. Invites issued
+/// before acceptance windows existed have no expiry record and never expire.
+fn invite_window_elapsed(env: &Env, fleet_id: u64, driver: &Address) -> bool {
+    env.storage()
+        .persistent()
+        .get::<_, u64>(&DataKey::InviteExpiry(fleet_id, driver.clone()))
+        .is_some_and(|expires_at| env.ledger().timestamp() > expires_at)
+}
+
+/// Drop the expiry record once an invite leaves the `Pending` state.
+fn clear_invite_expiry(env: &Env, fleet_id: u64, driver: &Address) {
+    env.storage()
+        .persistent()
+        .remove(&DataKey::InviteExpiry(fleet_id, driver.clone()));
+}
+
 fn require_escrow_not_paused(env: &Env) {
     let Some(escrow_contract) = env
         .storage()
@@ -66,15 +168,26 @@ fn require_escrow_not_paused(env: &Env) {
 /// complete a delivery (the reputation cross-contract call panics), the fleet
 /// owner would have to pay gas to evict it later.
 ///
-/// The check is skipped when no identity contract is configured, preserving
-/// the pre-#451 behaviour for standalone deployments that do not run the
-/// identity/reputation contract at all.
+/// When no identity contract is configured (including while a proposed one
+/// is still inside its timelock), the check fails closed with
+/// `FleetError::IdentityNotConfigured` unless the admin has deliberately
+/// enabled no-identity mode via `set_identity_optional`. Standalone
+/// deployments that do not run the identity/reputation contract must opt in
+/// explicitly rather than silently admitting unregistered drivers.
 fn require_registered_driver(env: &Env, driver: &Address) {
     let Some(identity_addr) = env
         .storage()
         .instance()
         .get::<DataKey, Address>(&DataKey::IdentityContract)
     else {
+        let identity_optional: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::IdentityOptional)
+            .unwrap_or(false);
+        if !identity_optional {
+            panic_with_error!(env, FleetError::IdentityNotConfigured);
+        }
         return;
     };
     let has_profile: bool = env.invoke_contract(
@@ -83,6 +196,18 @@ fn require_registered_driver(env: &Env, driver: &Address) {
         soroban_sdk::vec![env, driver.clone().into_val(env)],
     );
     if !has_profile {
+        panic_with_error!(env, FleetError::DriverNotRegistered);
+    }
+
+    // Issue #122 — reject suspended drivers, mirroring the delivery
+    // assignment policy. A reinstated driver's profile status returns to
+    // `Active`, so the same still-valid invite can then be accepted.
+    let profile: DriverProfile = env.invoke_contract(
+        &identity_addr,
+        &Symbol::new(env, "get_driver_profile"),
+        soroban_sdk::vec![env, driver.clone().into_val(env)],
+    );
+    if profile.status == DriverStatus::Suspended {
         panic_with_error!(env, FleetError::DriverNotRegistered);
     }
 }
@@ -144,8 +269,9 @@ pub enum FleetError {
     NoPendingTreasuryChange = 8,
     FleetInactive = 10,
     InvalidConfiguration = 11,
-    /// Roster compaction read a slot that was expected to exist but was absent
-    /// from persistent storage — indicates corrupted or out-of-sync state.
+    /// A roster read (`get_fleet_roster`, `renew_fleet_roster`) or roster
+    /// compaction found a slot that was expected to exist but was absent from
+    /// persistent storage — indicates corrupted or out-of-sync state.
     InternalStorageError = 12,
     /// The accepting address has no `DriverProfile` in the configured
     /// identity_reputation_contract, so it cannot legally complete a
@@ -156,6 +282,10 @@ pub enum FleetError {
     NoPendingContractChange = 15,
     ContractChangeTimelockNotElapsed = 16,
     NoPendingOwnerReassignment = 17,
+    /// A driver-registration check ran with no identity contract configured
+    /// and the deployment has not opted into no-identity mode via
+    /// `set_identity_optional`.
+    IdentityNotConfigured = 18,
 }
 
 #[contracttype]
@@ -167,6 +297,12 @@ pub enum DriverFleetStatus {
     Active,
     /// Driver has been removed from the fleet (terminal state, historical record preserved).
     Removed,
+    /// Driver was invited but did not accept within
+    /// `INVITE_ACCEPTANCE_WINDOW_SECONDS`. Never stored: reported by
+    /// `get_driver_fleet_status` for a `Pending` invite whose window elapsed,
+    /// so clients can tell an expired invitation apart from no invitation
+    /// (`None`). The fleet may re-invite the driver.
+    Expired,
 }
 
 #[contracttype]
@@ -203,14 +339,19 @@ pub enum DataKey {
     IdentityContract,
     /// Instance key — address of the escrow contract used for pause checks.
     EscrowContract,
-    /// Persistent key — monotonically incrementing fleet counter.
+    /// Persistent key — monotonically incrementing fleet counter. Its TTL is
+    /// renewed on every state-changing call via `renew_contract_state`.
     FleetCounter,
     /// Persistent key — fleet profile keyed by fleet id.
     Fleet(u64),
     /// Persistent key — driver's status within a fleet (Pending | Active).
     DriverFleet(u64, Address),
     /// Persistent key — one active roster entry, keyed by fleet and index.
+    /// Always renewed together with the matching `DriverFleet` record.
     FleetRoster(u64, u32),
+    /// Persistent key — the roster slot index for an active driver, enabling
+    /// O(1) removal without a linear scan (Issue #125).
+    DriverRosterIndex(u64, Address),
     /// Persistent key — pending, not-yet-confirmed treasury change for a fleet.
     PendingTreasury(u64),
     /// Persistent key — pending admin-proposed owner reassignment for a fleet.
@@ -219,6 +360,9 @@ pub enum DataKey {
     PendingIdentityContract,
     /// Instance key — pending escrow contract address awaiting confirmation.
     PendingEscrowContract,
+    /// Instance key — `true` when the deployment has deliberately opted out
+    /// of identity integration (no-identity mode). Defaults to `false`.
+    IdentityOptional,
 }
 
 #[contracttype]
@@ -251,10 +395,17 @@ impl FleetManagementContract {
             panic_with_error!(&env, TrustchainError::AlreadyInitialized);
         }
         admin.require_auth();
+        // Issue #94: an admin equal to this contract's own address can never
+        // legitimately authorize anything via require_auth.
+        shared_types::validate_init_addresses(&env, &[&admin]);
         env.storage().instance().set(&StorageKey::Admin, &admin);
         env.storage()
             .persistent()
             .set(&DataKey::FleetCounter, &0u64);
+        // A freshly written persistent entry only receives the network's
+        // minimum TTL; renew the counter (and instance) immediately so the
+        // first fleet registration does not depend on it surviving that.
+        renew_contract_state(&env);
     }
 
     /// Propose an identity_reputation_contract address. The address takes
@@ -281,7 +432,7 @@ impl FleetManagementContract {
             .instance()
             .extend_ttl(ttl::LEDGER_TTL_THRESHOLD, ttl::LEDGER_TTL_EXTEND_TO);
         env.events().publish(
-            (Symbol::new(&env, "identity_contract_change_proposed"),),
+            (Symbol::new(&env, "identity_contract_proposed"),),
             (admin, identity_contract, activates_at),
         );
     }
@@ -321,6 +472,45 @@ impl FleetManagementContract {
         env.storage()
             .instance()
             .get(&DataKey::IdentityContract)
+    }
+
+    /// Explicitly enable or disable no-identity mode.
+    ///
+    /// By default `add_driver_to_fleet` and `accept_fleet_invite` fail closed
+    /// with `FleetError::IdentityNotConfigured` while no identity contract is
+    /// configured, so a missing peer cannot admit unregistered drivers to an
+    /// active fleet. Standalone deployments that do not run the identity
+    /// contract must set `optional = true` deliberately. The flag only
+    /// matters while no identity contract is configured; once one is
+    /// confirmed, registration is always required.
+    ///
+    /// **Authorization:** Admin only.
+    #[allow(deprecated)] // events().publish() is deprecated in SDK 27.0.0 but still functional; tracked in SOROBAN_SDK_27_MIGRATION.md#event-system-migration (Issue #114)
+    pub fn set_identity_optional(env: Env, admin: Address, optional: bool) {
+        admin.require_auth();
+        if !is_admin(&env, &admin) {
+            panic_with_error!(&env, TrustchainError::Unauthorized);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::IdentityOptional, &optional);
+        env.storage()
+            .instance()
+            .extend_ttl(ttl::LEDGER_TTL_THRESHOLD, ttl::LEDGER_TTL_EXTEND_TO);
+        env.events().publish(
+            (Symbol::new(&env, "identity_optional_updated"),),
+            (admin, optional),
+        );
+    }
+
+    /// `true` when no-identity mode is enabled; `false` (default) means
+    /// driver invitations and acceptances require a configured identity
+    /// contract.
+    pub fn get_identity_optional(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::IdentityOptional)
+            .unwrap_or(false)
     }
 
     /// Propose an escrow contract address. The address takes effect only
@@ -398,7 +588,7 @@ impl FleetManagementContract {
     /// profile for the owner via a cross-contract call.
     #[allow(deprecated)] // events().publish() is deprecated in SDK 27.0.0 but still functional; tracked in SOROBAN_SDK_27_MIGRATION.md#event-system-migration (Issue #114)
     pub fn register_fleet(env: Env, owner: Address, treasury: Address) -> u64 {
-        env.storage().instance().extend_ttl(ttl::LEDGER_TTL_THRESHOLD, ttl::LEDGER_TTL_EXTEND_TO);
+        renew_contract_state(&env);
         owner.require_auth();
         require_escrow_not_paused(&env);
         if owner == treasury {
@@ -415,6 +605,11 @@ impl FleetManagementContract {
 
         let fleet_id: u64 = current + 1;
         env.storage().persistent().set(&counter_key, &fleet_id);
+        env.storage().persistent().extend_ttl(
+            &counter_key,
+            ttl::LEDGER_TTL_THRESHOLD,
+            ttl::LEDGER_TTL_EXTEND_TO,
+        );
 
         // Build and store the fleet profile with single-owner multi-sig (backward compatible).
         let mut signers = soroban_sdk::Vec::new(&env);
@@ -492,7 +687,7 @@ impl FleetManagementContract {
     /// `remove_driver_from_fleet` if desired.
     #[allow(deprecated)] // events().publish() is deprecated in SDK 27.0.0 but still functional; tracked in SOROBAN_SDK_27_MIGRATION.md#event-system-migration (Issue #114)
     pub fn deactivate_fleet(env: Env, caller: Address, fleet_id: u64) {
-        env.storage().instance().extend_ttl(ttl::LEDGER_TTL_THRESHOLD, ttl::LEDGER_TTL_EXTEND_TO);
+        renew_contract_state(&env);
         caller.require_auth();
         require_escrow_not_paused(&env);
 
@@ -536,7 +731,7 @@ impl FleetManagementContract {
     /// fleet treasury.
     #[allow(deprecated)] // events().publish() is deprecated in SDK 27.0.0 but still functional; tracked in SOROBAN_SDK_27_MIGRATION.md#event-system-migration (Issue #114)
     pub fn reactivate_fleet(env: Env, caller: Address, fleet_id: u64) {
-        env.storage().instance().extend_ttl(ttl::LEDGER_TTL_THRESHOLD, ttl::LEDGER_TTL_EXTEND_TO);
+        renew_contract_state(&env);
         caller.require_auth();
         require_escrow_not_paused(&env);
 
@@ -583,7 +778,7 @@ impl FleetManagementContract {
     /// pending treasury remain unchanged until the target accepts.
     #[allow(deprecated)] // events().publish() is deprecated in SDK 27.0.0 but still functional; tracked in SOROBAN_SDK_27_MIGRATION.md#event-system-migration (Issue #114)
     pub fn admin_reassign_fleet_owner(env: Env, admin: Address, fleet_id: u64, new_owner: Address) {
-        env.storage().instance().extend_ttl(ttl::LEDGER_TTL_THRESHOLD, ttl::LEDGER_TTL_EXTEND_TO);
+        renew_contract_state(&env);
         admin.require_auth();
 
         if !is_admin(&env, &admin) {
@@ -608,10 +803,33 @@ impl FleetManagementContract {
             ttl::LEDGER_TTL_EXTEND_TO,
         );
         env.events().publish(
-            (Symbol::new(&env, "fleet_owner_reassignment_proposed"),),
+            (Symbol::new(&env, "fleet_owner_reassign_proposed"),),
             (fleet_id, admin, new_owner),
         );
     }
+
+    /// Accept an admin-proposed fleet owner reassignment. Only the exact
+    /// proposed address can accept, and the address must authorize this call.
+    #[allow(deprecated)] // events().publish() is deprecated in SDK 27.0.0 but still functional; tracked in SOROBAN_SDK_27_MIGRATION.md#event-system-migration (Issue #114)
+    pub fn accept_fleet_owner_reassignment(env: Env, new_owner: Address, fleet_id: u64) {
+        env.storage().instance().extend_ttl(ttl::LEDGER_TTL_THRESHOLD, ttl::LEDGER_TTL_EXTEND_TO);
+        new_owner.require_auth();
+        let pending_key = DataKey::PendingFleetOwnerReassignment(fleet_id);
+        let pending: PendingFleetOwnerReassignment = env
+            .storage()
+            .persistent()
+            .get(&pending_key)
+            .unwrap_or_else(|| panic_with_error!(&env, FleetError::NoPendingOwnerReassignment));
+        if pending.new_owner != new_owner {
+            panic_with_error!(&env, TrustchainError::Unauthorized);
+        }
+
+        let fleet_key = DataKey::Fleet(fleet_id);
+        let mut profile: FleetProfile = env
+            .storage()
+            .persistent()
+            .get(&fleet_key)
+            .unwrap_or_else(|| panic_with_error!(&env, FleetError::FleetNotFound));
 
         if new_owner == profile.treasury {
             panic_with_error!(&env, FleetError::InvalidConfiguration);
@@ -651,7 +869,7 @@ impl FleetManagementContract {
         );
     }
 
-    pub fn get_pending_fleet_owner_reassignment(
+    pub fn get_pending_owner_reassignment(
         env: Env,
         fleet_id: u64,
     ) -> Option<PendingFleetOwnerReassignment> {
@@ -682,7 +900,7 @@ impl FleetManagementContract {
         fleet_id: u64,
         new_treasury: Address,
     ) {
-        env.storage().instance().extend_ttl(ttl::LEDGER_TTL_THRESHOLD, ttl::LEDGER_TTL_EXTEND_TO);
+        renew_contract_state(&env);
         admin.require_auth();
 
         if !is_admin(&env, &admin) {
@@ -748,7 +966,7 @@ impl FleetManagementContract {
         treasury: Address,
         co_signers: soroban_sdk::Vec<Address>,
     ) {
-        env.storage().instance().extend_ttl(ttl::LEDGER_TTL_THRESHOLD, ttl::LEDGER_TTL_EXTEND_TO);
+        renew_contract_state(&env);
         owner.require_auth();
         require_escrow_not_paused(&env);
 
@@ -806,7 +1024,7 @@ impl FleetManagementContract {
     /// supposed to be frozen for historical auditing (Issue #467).
     #[allow(deprecated)] // events().publish() is deprecated in SDK 27.0.0 but still functional; tracked in SOROBAN_SDK_27_MIGRATION.md#event-system-migration (Issue #114)
     pub fn confirm_fleet_treasury_update(env: Env, fleet_id: u64) {
-        env.storage().instance().extend_ttl(ttl::LEDGER_TTL_THRESHOLD, ttl::LEDGER_TTL_EXTEND_TO);
+        renew_contract_state(&env);
         require_escrow_not_paused(&env);
         let pending_key = DataKey::PendingTreasury(fleet_id);
         let pending: PendingTreasuryChange = env
@@ -872,8 +1090,10 @@ impl FleetManagementContract {
     ///
     /// `caller` must be an authorized signer and must sign the transaction.
     /// Stores a `Pending` invite for `driver` under this fleet.
-    /// If an identity contract is configured, the driver must already be
-    /// registered there before an invitation can be issued.
+    /// The driver must already be registered in the configured identity
+    /// contract before an invitation can be issued. With none configured this
+    /// fails with `FleetError::IdentityNotConfigured` unless no-identity mode
+    /// is enabled via `set_identity_optional`.
     /// The driver must later call `accept_fleet_invite` to become active.
     /// `co_signers` supplies any additional signer authorizations needed to
     /// satisfy the fleet's `signature_threshold` beyond `caller` alone — pass
@@ -886,7 +1106,7 @@ impl FleetManagementContract {
         driver: Address,
         co_signers: soroban_sdk::Vec<Address>,
     ) {
-        env.storage().instance().extend_ttl(ttl::LEDGER_TTL_THRESHOLD, ttl::LEDGER_TTL_EXTEND_TO);
+        renew_contract_state(&env);
         caller.require_auth();
         require_escrow_not_paused(&env);
 
@@ -905,32 +1125,41 @@ impl FleetManagementContract {
 
         let invite_key = DataKey::DriverFleet(fleet_id, driver.clone());
 
-        // Guard: do not overwrite an existing invite or active membership.
-        // Removed drivers may be re-invited.
+        // Guard: do not overwrite an unexpired invite or active membership.
+        // Removed drivers, and drivers whose invite expired, may be re-invited.
         if env.storage().persistent().has(&invite_key) {
             let existing: DriverFleetStatus = env.storage().persistent().get(&invite_key).unwrap();
             match existing {
                 DriverFleetStatus::Pending => {
-                    panic_with_error!(&env, FleetError::DriverAlreadyInvited)
+                    if !invite_window_elapsed(&env, fleet_id, &driver) {
+                        panic_with_error!(&env, FleetError::DriverAlreadyInvited)
+                    }
                 }
                 DriverFleetStatus::Active => {
                     panic_with_error!(&env, FleetError::DriverAlreadyActive)
                 }
-                DriverFleetStatus::Removed => {
+                DriverFleetStatus::Removed | DriverFleetStatus::Expired => {
                     // Allow re-inviting a previously removed driver.
                 }
             }
         }
 
-        // Record the pending invite.
+        // Record the pending invite and when its acceptance window closes.
+        // Both records get a TTL that outlives the window (see the const
+        // assertion on INVITE_ACCEPTANCE_WINDOW_SECONDS), so the invite cannot
+        // be archived before the driver has had the full window to accept.
+        let expires_at = env
+            .ledger()
+            .timestamp()
+            .saturating_add(INVITE_ACCEPTANCE_WINDOW_SECONDS);
         env.storage()
             .persistent()
             .set(&invite_key, &DriverFleetStatus::Pending);
-        env.storage().persistent().extend_ttl(
-            &invite_key,
-            ttl::LEDGER_TTL_THRESHOLD,
-            ttl::LEDGER_TTL_EXTEND_TO,
+        env.storage().persistent().set(
+            &DataKey::InviteExpiry(fleet_id, driver.clone()),
+            &expires_at,
         );
+        renew_pending_invite(&env, fleet_id, &driver);
 
         // Emit event.
         env.events().publish(
@@ -965,7 +1194,7 @@ impl FleetManagementContract {
         driver: Address,
         co_signers: soroban_sdk::Vec<Address>,
     ) {
-        env.storage().instance().extend_ttl(ttl::LEDGER_TTL_THRESHOLD, ttl::LEDGER_TTL_EXTEND_TO);
+        renew_contract_state(&env);
         owner.require_auth();
         require_escrow_not_paused(&env);
 
@@ -987,6 +1216,7 @@ impl FleetManagementContract {
         if status != DriverFleetStatus::Pending {
             panic_with_error!(&env, FleetError::DriverAlreadyActive);
         }
+        clear_invite_expiry(&env, fleet_id, &driver);
 
         // Transition to the terminal Removed state instead of deleting the
         // record, matching `remove_driver_from_fleet` so a cancelled invite
@@ -1012,11 +1242,12 @@ impl FleetManagementContract {
     /// rejected with `FleetError::DriverNotRegistered` (Issue #451). Only
     /// registered drivers can legally complete deliveries, so letting an
     /// unregistered address into the roster would permanently waste one of
-    /// the `MAX_ROSTER_SIZE`-bounded roster slots. The check is skipped when
-    /// no identity contract is configured.
+    /// the `MAX_ROSTER_SIZE`-bounded roster slots. With no identity contract
+    /// configured this fails with `FleetError::IdentityNotConfigured` unless
+    /// no-identity mode is enabled via `set_identity_optional`.
     #[allow(deprecated)] // events().publish() is deprecated in SDK 27.0.0 but still functional; tracked in SOROBAN_SDK_27_MIGRATION.md#event-system-migration (Issue #114)
     pub fn accept_fleet_invite(env: Env, fleet_id: u64, driver: Address) {
-        env.storage().instance().extend_ttl(ttl::LEDGER_TTL_THRESHOLD, ttl::LEDGER_TTL_EXTEND_TO);
+        renew_contract_state(&env);
         // Driver must authorise.
         driver.require_auth();
         require_escrow_not_paused(&env);
@@ -1049,8 +1280,14 @@ impl FleetManagementContract {
 
         match status {
             DriverFleetStatus::Active => panic_with_error!(&env, FleetError::DriverAlreadyActive),
-            DriverFleetStatus::Pending => {}
-            DriverFleetStatus::Removed => panic_with_error!(&env, FleetError::InviteNotFound),
+            DriverFleetStatus::Pending => {
+                if invite_window_elapsed(&env, fleet_id, &driver) {
+                    panic_with_error!(&env, FleetError::InviteExpired);
+                }
+            }
+            DriverFleetStatus::Removed | DriverFleetStatus::Expired => {
+                panic_with_error!(&env, FleetError::InviteNotFound)
+            }
         }
 
         // Guard against unbounded roster growth before changing membership state.
@@ -1058,15 +1295,11 @@ impl FleetManagementContract {
             panic_with_error!(&env, FleetError::RosterFull);
         }
 
-        // Promote driver to active.
+        // Promote driver to active; the acceptance window no longer applies.
         env.storage()
             .persistent()
             .set(&invite_key, &DriverFleetStatus::Active);
-        env.storage().persistent().extend_ttl(
-            &invite_key,
-            ttl::LEDGER_TTL_THRESHOLD,
-            ttl::LEDGER_TTL_EXTEND_TO,
-        );
+        clear_invite_expiry(&env, fleet_id, &driver);
 
         // Update active driver count on the fleet profile.
         profile.total_active_drivers += 1;
@@ -1080,10 +1313,17 @@ impl FleetManagementContract {
 
         // Add the driver as one indexed roster entry. The previous active
         // count is the next free roster index.
-        let roster_key = DataKey::FleetRoster(fleet_id, profile.total_active_drivers - 1);
+        let roster_index = profile.total_active_drivers - 1;
+        let roster_key = DataKey::FleetRoster(fleet_id, roster_index);
         env.storage().persistent().set(&roster_key, &driver);
+        // Membership and roster slot start with the same lifetime.
+        renew_active_membership(&env, fleet_id, &driver, roster_index);
+
+        // Record the driver's slot index so removal is O(1) (Issue #125).
+        let index_key = DataKey::DriverRosterIndex(fleet_id, driver.clone());
+        env.storage().persistent().set(&index_key, &roster_slot);
         env.storage().persistent().extend_ttl(
-            &roster_key,
+            &index_key,
             ttl::LEDGER_TTL_THRESHOLD,
             ttl::LEDGER_TTL_EXTEND_TO,
         );
@@ -1118,7 +1358,7 @@ impl FleetManagementContract {
         driver: Address,
         co_signers: soroban_sdk::Vec<Address>,
     ) {
-        env.storage().instance().extend_ttl(ttl::LEDGER_TTL_THRESHOLD, ttl::LEDGER_TTL_EXTEND_TO);
+        renew_contract_state(&env);
         let mut profile: FleetProfile = env
             .storage()
             .persistent()
@@ -1128,6 +1368,14 @@ impl FleetManagementContract {
         // The caller must sign this transaction.
         caller.require_auth();
         require_escrow_not_paused(&env);
+
+        // Issue #123: a deactivated fleet's membership is frozen.
+        // Drivers cannot be removed from an inactive fleet — both owner-
+        // initiated and driver self-exit removals are blocked to keep the
+        // historical roster immutable after shutdown.
+        if !profile.active {
+            panic_with_error!(&env, FleetError::FleetInactive);
+        }
 
         // Verify caller is authorised: must be either an authorized signer or the driver.
         let is_driver = caller == driver;
@@ -1177,6 +1425,9 @@ impl FleetManagementContract {
         }
 
         // Transition to Removed terminal state instead of deleting, preserving historical record.
+        if status == DriverFleetStatus::Pending {
+            clear_invite_expiry(&env, fleet_id, &driver);
+        }
         env.storage()
             .persistent()
             .set(&invite_key, &DriverFleetStatus::Removed);
@@ -1186,28 +1437,22 @@ impl FleetManagementContract {
             ttl::LEDGER_TTL_EXTEND_TO,
         );
 
-        // Remove the driver from the indexed roster and compact the remaining
-        // entries so enumeration stays contiguous without rewriting one large value.
+        // Remove the driver from the indexed roster using the stored slot index
+        // so removal is O(1) regardless of roster size (Issue #125). No
+        // linear scan is needed.
         if status == DriverFleetStatus::Active {
             let roster_len = profile.total_active_drivers + 1;
-            let mut removed_index = None;
-            for index in 0..roster_len {
-                let roster_key = DataKey::FleetRoster(fleet_id, index);
-                if env
-                    .storage()
-                    .persistent()
-                    .get::<_, Address>(&roster_key)
-                    .is_some_and(|existing| existing == driver)
-                {
-                    removed_index = Some(index);
-                    break;
-                }
-            }
+            let index_key = DataKey::DriverRosterIndex(fleet_id, driver.clone());
+            let removed_index: Option<u32> = env.storage().persistent().get(&index_key);
 
             if let Some(index) = removed_index {
+                // Remove the now-stale index entry for this driver.
+                env.storage().persistent().remove(&index_key);
+
                 let last_index = roster_len - 1;
                 if index != last_index {
-                    // Swap the last driver into the removed slot.
+                    // Swap the last driver into the removed slot and update
+                    // their index entry so future removals remain O(1).
                     let last_key = DataKey::FleetRoster(fleet_id, last_index);
                     let removed_slot_key = DataKey::FleetRoster(fleet_id, index);
                     let last_driver: Address = env
@@ -1220,11 +1465,10 @@ impl FleetManagementContract {
                     env.storage()
                         .persistent()
                         .set(&removed_slot_key, &last_driver);
-                    env.storage().persistent().extend_ttl(
-                        &removed_slot_key,
-                        ttl::LEDGER_TTL_THRESHOLD,
-                        ttl::LEDGER_TTL_EXTEND_TO,
-                    );
+                    // Renew the moved driver's membership together with its
+                    // new slot; renewing only the slot would leave the two
+                    // records on diverging TTLs.
+                    renew_active_membership(&env, fleet_id, &last_driver, index);
                 }
                 // Delete the now-vacant last slot.
                 env.storage()
@@ -1247,9 +1491,16 @@ impl FleetManagementContract {
     ///
     /// Returns the fleet's treasury if the driver is an active member of that
     /// fleet, otherwise returns the driver's own address.
-    #[allow(deprecated)]
+    ///
+    /// Issue #126: this is a purely observational routing query and emits no
+    /// events. It used to publish `payout_routing_fallback` whenever an active
+    /// member's fleet was inactive or missing, so repeated simulations or
+    /// balance checks produced indistinguishable fallback events unrelated to
+    /// any real payout. The fallback event now belongs to the escrow payout
+    /// settlement path, which emits exactly one `payout_routing_fallback`
+    /// naming the escrow whenever it actually settles a fallback payout.
     pub fn get_payout_address(env: Env, driver: Address, fleet_id: u64) -> Address {
-        env.storage().instance().extend_ttl(ttl::LEDGER_TTL_THRESHOLD, ttl::LEDGER_TTL_EXTEND_TO);
+        renew_contract_state(&env);
         let status: Option<DriverFleetStatus> = env
             .storage()
             .persistent()
@@ -1264,37 +1515,55 @@ impl FleetManagementContract {
                 match profile {
                     Some(profile) if profile.active => profile.treasury,
                     // An inactive fleet and a missing fleet profile both fall
-                    // back to the driver's own address — publish the
-                    // routing-fallback event in both cases so off-chain
-                    // monitors can observe the downgrade.  Previously an
-                    // inactive fleet fell back silently, hiding the routing
-                    // change from event consumers.
-                    Some(_) | None => {
-                        env.events().publish(
-                            (events::payout_routing_fallback(&env),),
-                            PayoutRoutingFallbackEvent {
-                                fleet_id,
-                                driver: driver.clone(),
-                            },
-                        );
-                        driver
-                    }
+                    // back to the driver's own address. No event is emitted
+                    // here (Issue #126); the settlement path reports it.
+                    Some(_) | None => driver,
                 }
             }
-            Some(DriverFleetStatus::Pending) | Some(DriverFleetStatus::Removed) | None => driver,
+            Some(DriverFleetStatus::Pending)
+            | Some(DriverFleetStatus::Removed)
+            | Some(DriverFleetStatus::Expired)
+            | None => driver,
         }
     }
 
-    /// Return the status of a driver within a fleet, or `None` if no record
-    /// exists.  Useful for off-chain queries and integration tests.
+    /// Return the status of a driver within a fleet, or `None` if the driver
+    /// was never invited.  A pending invite whose acceptance window has
+    /// elapsed is reported as `DriverFleetStatus::Expired`, so clients can
+    /// distinguish an expired invitation from no invitation at all.
     pub fn get_driver_fleet_status(
         env: Env,
         fleet_id: u64,
         driver: Address,
     ) -> Option<DriverFleetStatus> {
+        let status: Option<DriverFleetStatus> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DriverFleet(fleet_id, driver.clone()));
+        match status {
+            Some(DriverFleetStatus::Pending) if invite_window_elapsed(&env, fleet_id, &driver) => {
+                Some(DriverFleetStatus::Expired)
+            }
+            other => other,
+        }
+    }
+
+    /// Return the ledger timestamp after which a driver's pending invite can
+    /// no longer be accepted, or `None` when the driver has no pending invite
+    /// (never invited, already active, removed, or an invite issued before
+    /// acceptance windows existed). The value is still returned after the
+    /// window has elapsed, so clients can show when the invite expired.
+    pub fn get_invite_expiry(env: Env, fleet_id: u64, driver: Address) -> Option<u64> {
+        let status: Option<DriverFleetStatus> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DriverFleet(fleet_id, driver.clone()));
+        if status != Some(DriverFleetStatus::Pending) {
+            return None;
+        }
         env.storage()
             .persistent()
-            .get(&DataKey::DriverFleet(fleet_id, driver))
+            .get(&DataKey::InviteExpiry(fleet_id, driver))
     }
 
     /// Return one page of the active driver roster for a fleet.
@@ -1310,6 +1579,9 @@ impl FleetManagementContract {
     /// The returned page is clamped to the fleet's actual active driver count.
     /// Returns an empty Vec if no drivers are active in the fleet or if
     /// `offset` is past the end of the roster.
+    ///
+    /// Panics with `InternalStorageError` if a slot inside the active range
+    /// is missing, instead of returning a silently incomplete page.
     pub fn get_fleet_roster(
         env: Env,
         fleet_id: u64,
@@ -1330,15 +1602,63 @@ impl FleetManagementContract {
         let end = offset.saturating_add(page_size).min(active_count);
 
         for index in offset..end {
-            if let Some(driver) = env
+            // Every index below `total_active_drivers` must hold a slot. A
+            // missing one means the roster is out of sync with membership, so
+            // fail loudly rather than return a silently short page that a
+            // paginating client would mistake for a complete roster.
+            let driver: Address = env
                 .storage()
                 .persistent()
-                .get::<_, Address>(&DataKey::FleetRoster(fleet_id, index))
-            {
-                roster.push_back(driver);
-            }
+                .get(&DataKey::FleetRoster(fleet_id, index))
+                .unwrap_or_else(|| panic_with_error!(&env, FleetError::InternalStorageError));
+            roster.push_back(driver);
         }
         roster
+    }
+
+    /// Renew the storage lifetime of one page of a fleet's active roster.
+    ///
+    /// For every roster slot in `[offset, offset + limit)` (clamped to
+    /// [`MAX_ROSTER_PAGE_SIZE`] and to the active driver count) this extends
+    /// both the `FleetRoster` slot and the driver's `DriverFleet` membership
+    /// record to the same TTL, along with the fleet profile and contract
+    /// state. It lets a fleet (or any keeper) keep a quiet roster alive and
+    /// resynchronise slot and membership lifetimes without changing any
+    /// state, mirroring Soroban's permissionless TTL extension.
+    ///
+    /// Returns the number of roster entries renewed. Panics with
+    /// `FleetNotFound` for an unknown fleet and `InternalStorageError` if a
+    /// slot that should exist is missing.
+    pub fn renew_fleet_roster(env: Env, fleet_id: u64, offset: u32, limit: u32) -> u32 {
+        renew_contract_state(&env);
+        let fleet_key = DataKey::Fleet(fleet_id);
+        let profile: FleetProfile = env
+            .storage()
+            .persistent()
+            .get(&fleet_key)
+            .unwrap_or_else(|| panic_with_error!(&env, FleetError::FleetNotFound));
+        env.storage().persistent().extend_ttl(
+            &fleet_key,
+            ttl::LEDGER_TTL_THRESHOLD,
+            ttl::LEDGER_TTL_EXTEND_TO,
+        );
+
+        let page_size = limit.min(MAX_ROSTER_PAGE_SIZE);
+        let end = offset
+            .saturating_add(page_size)
+            .min(profile.total_active_drivers);
+
+        let mut renewed = 0u32;
+        for index in offset..end {
+            let driver: Address = env
+                .storage()
+                .persistent()
+                .get(&DataKey::FleetRoster(fleet_id, index))
+                .unwrap_or_else(|| panic_with_error!(&env, FleetError::InternalStorageError));
+            renew_active_membership(&env, fleet_id, &driver, index);
+            renewed += 1;
+        }
+        renewed
     }
 
     /// Configure multi-signature requirements for a fleet.
@@ -1353,7 +1673,7 @@ impl FleetManagementContract {
         threshold: u32,
         co_signers: soroban_sdk::Vec<Address>,
     ) {
-        env.storage().instance().extend_ttl(ttl::LEDGER_TTL_THRESHOLD, ttl::LEDGER_TTL_EXTEND_TO);
+        renew_contract_state(&env);
         owner.require_auth();
         require_escrow_not_paused(&env);
 
@@ -1387,6 +1707,15 @@ impl FleetManagementContract {
         }
 
         if threshold == 0 || threshold > signers.len() {
+            panic_with_error!(&env, FleetError::InvalidConfiguration);
+        }
+
+        // Issue #124: the fleet owner must be a member of the signer set so
+        // they always retain a path to update signers again. A signer set that
+        // excludes the owner would require co-signer authorization for every
+        // future `configure_signers` call; if those keys become unavailable the
+        // owner permanently loses governance control.
+        if !unique_signers.contains(&profile.owner) {
             panic_with_error!(&env, FleetError::InvalidConfiguration);
         }
 

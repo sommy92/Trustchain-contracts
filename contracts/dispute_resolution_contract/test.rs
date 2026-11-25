@@ -273,7 +273,9 @@ fn create_mock_escrow_record(
         disputed_by: None,
         disputed_at: None,
         holdback_started_at: None,
+        holdback_deadline: None,
         fleet_id: None,
+        locked_fee_bps: 0,
     }
 }
 
@@ -327,6 +329,133 @@ fn test_admin_whitelist_management() {
     approve_admin_removal(&dispute_client, &admin, &new_admin, &admin);
     assert!(!dispute_client.is_admin(&admin));
     assert!(dispute_client.is_admin(&new_admin));
+}
+
+/// Issue #115: a pending roster approval must expire. A proposal made under an
+/// old governance context cannot be completed much later by another admin.
+#[test]
+fn test_expired_admin_add_approval_cannot_complete_roster_change() {
+    let (env, admin, _, _, _, _, _, dispute_client) = setup_test();
+    let second_admin = Address::generate(&env);
+    bootstrap_admin(&dispute_client, &admin, &second_admin);
+
+    let nominee = Address::generate(&env);
+    dispute_client.add_admin(&admin, &nominee);
+    assert!(!dispute_client.is_admin(&nominee));
+
+    // Advance past the approval validity window.
+    env.ledger().set_timestamp(
+        env.ledger().timestamp() + shared_types::ADMIN_APPROVAL_VALIDITY_SECONDS + 1,
+    );
+
+    // The stale approval no longer counts; the nominee is not added.
+    let result = dispute_client.try_add_admin(&second_admin, &nominee);
+    match result {
+        Err(Ok(err)) => assert_eq!(err, TrustchainError::InvalidState.into()),
+        other => panic!("expected InvalidState for an expired approval, got {other:?}"),
+    }
+    assert!(!dispute_client.is_admin(&nominee));
+}
+
+/// Issue #115: a pending roster approval must be explicitly withdrawable.
+#[test]
+fn test_cancelled_admin_add_approval_cannot_complete_roster_change() {
+    let (env, admin, _, _, _, _, _, dispute_client) = setup_test();
+    let second_admin = Address::generate(&env);
+    bootstrap_admin(&dispute_client, &admin, &second_admin);
+
+    let nominee = Address::generate(&env);
+    dispute_client.add_admin(&admin, &nominee);
+    dispute_client.cancel_pending_admin_add(&admin, &nominee);
+
+    let result = dispute_client.try_add_admin(&second_admin, &nominee);
+    match result {
+        Err(Ok(err)) => assert_eq!(err, TrustchainError::InvalidState.into()),
+        other => panic!("expected InvalidState for a cancelled approval, got {other:?}"),
+    }
+    assert!(!dispute_client.is_admin(&nominee));
+}
+
+/// Issue #115: the same expiry/cancellation rules apply to removals.
+#[test]
+fn test_expired_admin_remove_approval_cannot_complete_roster_change() {
+    let (env, admin, _, _, _, _, _, dispute_client) = setup_test();
+    let second_admin = Address::generate(&env);
+    let third_admin = Address::generate(&env);
+    bootstrap_admin(&dispute_client, &admin, &second_admin);
+    approve_admin_add(&dispute_client, &admin, &second_admin, &third_admin);
+
+    dispute_client.remove_admin(&admin, &third_admin);
+    env.ledger().set_timestamp(
+        env.ledger().timestamp() + shared_types::ADMIN_APPROVAL_VALIDITY_SECONDS + 1,
+    );
+
+    let result = dispute_client.try_remove_admin(&second_admin, &third_admin);
+    match result {
+        Err(Ok(err)) => assert_eq!(err, TrustchainError::InvalidState.into()),
+        other => panic!("expected InvalidState for an expired removal approval, got {other:?}"),
+    }
+    assert!(dispute_client.is_admin(&third_admin));
+}
+
+/// Issue #115: a pending removal approval can be withdrawn.
+#[test]
+fn test_cancelled_admin_remove_approval_cannot_complete_roster_change() {
+    let (env, admin, _, _, _, _, _, dispute_client) = setup_test();
+    let second_admin = Address::generate(&env);
+    let third_admin = Address::generate(&env);
+    bootstrap_admin(&dispute_client, &admin, &second_admin);
+    approve_admin_add(&dispute_client, &admin, &second_admin, &third_admin);
+
+    dispute_client.remove_admin(&admin, &third_admin);
+    dispute_client.cancel_pending_admin_remove(&admin, &third_admin);
+
+    let result = dispute_client.try_remove_admin(&second_admin, &third_admin);
+    match result {
+        Err(Ok(err)) => assert_eq!(err, TrustchainError::InvalidState.into()),
+        other => panic!("expected InvalidState for a cancelled removal approval, got {other:?}"),
+    }
+    assert!(dispute_client.is_admin(&third_admin));
+}
+
+/// Issue #116: successful roster mutations must renew the instance TTL so a
+/// governance-only deployment does not approach archival.
+#[test]
+fn test_admin_roster_mutations_extend_instance_ttl() {
+    let (env, admin, _, _, _, _, _, dispute_client) = setup_test();
+    let dispute_id = dispute_client.address.clone();
+
+    let second_admin = Address::generate(&env);
+    env.ledger().with_mut(|ledger| {
+        ledger.sequence_number += ttl::LEDGER_TTL_EXTEND_TO - 10;
+    });
+    dispute_client.add_admin(&admin, &second_admin);
+    let remaining_ttl = env.deployer().get_contract_instance_ttl(&dispute_id);
+    assert!(
+        remaining_ttl >= ttl::LEDGER_TTL_THRESHOLD,
+        "add_admin must extend instance TTL (got {remaining_ttl})"
+    );
+
+    env.ledger().with_mut(|ledger| {
+        ledger.sequence_number += ttl::LEDGER_TTL_EXTEND_TO - 10;
+    });
+    dispute_client.accept_admin(&second_admin);
+    let remaining_ttl = env.deployer().get_contract_instance_ttl(&dispute_id);
+    assert!(
+        remaining_ttl >= ttl::LEDGER_TTL_THRESHOLD,
+        "accept_admin must extend instance TTL (got {remaining_ttl})"
+    );
+
+    env.ledger().with_mut(|ledger| {
+        ledger.sequence_number += ttl::LEDGER_TTL_EXTEND_TO - 10;
+    });
+    approve_admin_removal(&dispute_client, &admin, &second_admin, &second_admin);
+    let remaining_ttl = env.deployer().get_contract_instance_ttl(&dispute_id);
+    assert!(
+        remaining_ttl >= ttl::LEDGER_TTL_THRESHOLD,
+        "remove_admin must extend instance TTL (got {remaining_ttl})"
+    );
+    assert!(!dispute_client.is_admin(&second_admin));
 }
 
 #[test]
@@ -725,6 +854,118 @@ fn test_resolve_dispute_refund_sender_by_admin() {
     assert_eq!(escrow.status, shared_types::EscrowStatus::Refunded);
 }
 
+/// Issue #120: a refund verdict must emit a `ReputationDecreasedEvent` that
+/// identifies the delivery that caused the penalty, so indexers can attribute
+/// the penalty to the dispute rather than guessing from the driver alone.
+#[test]
+fn test_refund_verdict_emits_penalty_event_with_delivery_id() {
+    use identity_reputation_contract::{
+        IdentityReputationContract, IdentityReputationContractClient, ReputationDecreasedEvent,
+        ReputationPenaltyReason,
+    };
+
+    let (env, admin, sender, recipient, driver, delivery_id, escrow_id, dispute_client) =
+        setup_test();
+
+    let identity_id = env.register(IdentityReputationContract, ());
+    let identity_client = IdentityReputationContractClient::new(&env, &identity_id);
+    identity_client.init(&admin, &delivery_id, &dispute_client.address);
+    dispute_client.set_identity_reputation_contract(&admin, &identity_id);
+    identity_client.register_driver(&driver);
+
+    let mut delivery_record = create_mock_delivery_record(
+        &env,
+        did(30),
+        sender.clone(),
+        recipient.clone(),
+        DeliveryStatus::Active,
+        None,
+    );
+    delivery_record.driver = Some(driver.clone());
+    set_mock_delivery(&env, &delivery_id, did(30), &delivery_record);
+
+    let escrow_record = create_mock_escrow_record(
+        sender.clone(),
+        recipient.clone(),
+        driver.clone(),
+        Address::generate(&env),
+        shared_types::EscrowStatus::Paused,
+    );
+    set_mock_escrow(&env, &escrow_id, 30, &escrow_record);
+
+    dispute_client.raise_dispute(&sender, &did(30));
+    dispute_client.resolve_dispute_refund_sender(&admin, &did(30));
+
+    let penalty = dispute_client.get_dispute_reputation_penalty();
+    let (topics, data) = last_event(&env);
+    let topic0: Symbol = Symbol::try_from_val(&env, &topics.get(0).unwrap()).unwrap();
+    assert_eq!(topic0, Symbol::new(&env, "reputation_decreased"));
+    let event: ReputationDecreasedEvent =
+        ReputationDecreasedEvent::try_from_val(&env, &data)
+            .expect("failed to decode ReputationDecreasedEvent");
+    assert_eq!(event.driver, driver);
+    assert_eq!(event.points, penalty);
+    assert_eq!(event.new_score, 50 - penalty);
+    assert_eq!(event.delivery_id, Some(did(30)));
+    assert_eq!(event.reason, Some(ReputationPenaltyReason::DisputeRefund));
+}
+
+/// Issue #120: a split verdict must emit a `ReputationDecreasedEvent` that
+/// identifies the delivery that caused the penalty, with the split reason code
+/// so indexers can distinguish it from a refund ruling.
+#[test]
+fn test_split_verdict_emits_penalty_event_with_delivery_id() {
+    use identity_reputation_contract::{
+        IdentityReputationContract, IdentityReputationContractClient, ReputationDecreasedEvent,
+        ReputationPenaltyReason,
+    };
+
+    let (env, admin, sender, recipient, driver, delivery_id, escrow_id, dispute_client) =
+        setup_test();
+
+    let identity_id = env.register(IdentityReputationContract, ());
+    let identity_client = IdentityReputationContractClient::new(&env, &identity_id);
+    identity_client.init(&admin, &delivery_id, &dispute_client.address);
+    dispute_client.set_identity_reputation_contract(&admin, &identity_id);
+    identity_client.register_driver(&driver);
+
+    let mut delivery_record = create_mock_delivery_record(
+        &env,
+        did(31),
+        sender.clone(),
+        recipient.clone(),
+        DeliveryStatus::Active,
+        None,
+    );
+    delivery_record.driver = Some(driver.clone());
+    set_mock_delivery(&env, &delivery_id, did(31), &delivery_record);
+
+    let escrow_record = create_mock_escrow_record(
+        sender.clone(),
+        recipient.clone(),
+        driver.clone(),
+        Address::generate(&env),
+        shared_types::EscrowStatus::Paused,
+    );
+    set_mock_escrow(&env, &escrow_id, 31, &escrow_record);
+
+    dispute_client.raise_dispute(&sender, &did(31));
+    dispute_client.resolve_dispute_split_funds(&admin, &did(31), &5000);
+
+    let penalty = dispute_client.get_dispute_split_penalty();
+    let (topics, data) = last_event(&env);
+    let topic0: Symbol = Symbol::try_from_val(&env, &topics.get(0).unwrap()).unwrap();
+    assert_eq!(topic0, Symbol::new(&env, "reputation_decreased"));
+    let event: ReputationDecreasedEvent =
+        ReputationDecreasedEvent::try_from_val(&env, &data)
+            .expect("failed to decode ReputationDecreasedEvent");
+    assert_eq!(event.driver, driver);
+    assert_eq!(event.points, penalty);
+    assert_eq!(event.new_score, 50 - penalty);
+    assert_eq!(event.delivery_id, Some(did(31)));
+    assert_eq!(event.reason, Some(ReputationPenaltyReason::DisputeSplit));
+}
+
 #[test]
 fn test_high_value_dispute_requires_two_distinct_mediators() {
     let (env, admin, sender, recipient, driver, delivery_id, escrow_id, dispute_client) =
@@ -750,7 +991,7 @@ fn test_high_value_dispute_requires_two_distinct_mediators() {
         Address::generate(&env),
         shared_types::EscrowStatus::Paused,
     );
-    escrow_record.amount = HIGH_VALUE_DISPUTE_THRESHOLD;
+    escrow_record.amount = shared_types::HIGH_VALUE_DISPUTE_THRESHOLD;
     set_mock_escrow(&env, &escrow_id, 40, &escrow_record);
     dispute_client.raise_dispute(&sender, &did(40));
 
@@ -1364,6 +1605,8 @@ fn test_integration_resolve_dispute_split_funds() {
     escrow_client.init(&admin, &token, &0);
     escrow_client.set_dispute_resolution_contract(&admin, &dispute_resolution_id);
     delivery_client.init(&admin, &escrow_contract_id);
+    // No identity contract here: opt into no-identity mode explicitly.
+    delivery_client.set_identity_optional(&admin, &true);
     // Issue #444: delivery::raise_dispute only accepts the configured dispute
     // contract, so the real integration flows must wire it up.
     delivery_client.set_dispute_resolution_contract(&admin, &dispute_resolution_id);
@@ -1470,6 +1713,8 @@ fn test_integration_resolve_dispute_refund_sender_decreases_reputation() {
     escrow_client.init(&admin, &token, &0);
     escrow_client.set_dispute_resolution_contract(&admin, &dispute_resolution_id);
     delivery_client.init(&admin, &escrow_contract_id);
+    // No identity contract here: opt into no-identity mode explicitly.
+    delivery_client.set_identity_optional(&admin, &true);
     // Issue #444: delivery::raise_dispute only accepts the configured dispute
     // contract, so the real integration flows must wire it up.
     delivery_client.set_dispute_resolution_contract(&admin, &dispute_resolution_id);
@@ -1532,6 +1777,23 @@ fn test_integration_resolve_dispute_refund_sender_decreases_reputation() {
     assert_eq!(
         identity_client.get_driver_profile(&driver).reputation_score,
         50 - penalty
+    );
+
+    // Issue #120: the penalty event must carry the dispute context so
+    // indexers can attribute it to the delivery and the ruling that caused it.
+    let (topics, data) = last_event(&env);
+    let topic0: Symbol = Symbol::try_from_val(&env, &topics.get(0).unwrap()).unwrap();
+    assert_eq!(topic0, Symbol::new(&env, "reputation_decreased"));
+    let event: identity_reputation_contract::ReputationDecreasedEvent =
+        identity_reputation_contract::ReputationDecreasedEvent::try_from_val(&env, &data)
+            .expect("failed to decode ReputationDecreasedEvent");
+    assert_eq!(event.driver, driver);
+    assert_eq!(event.points, penalty);
+    assert_eq!(event.new_score, 50 - penalty);
+    assert_eq!(event.delivery_id, Some(delivery_id_val));
+    assert_eq!(
+        event.reason,
+        Some(identity_reputation_contract::ReputationPenaltyReason::DisputeRefund)
     );
 
     // The sender got their funds back; the driver's reputation is the only
@@ -1645,6 +1907,8 @@ fn test_integration_resolve_dispute_pay_driver_increases_reputation() {
     escrow_client.init(&admin, &token, &0);
     escrow_client.set_dispute_resolution_contract(&admin, &dispute_resolution_id);
     delivery_client.init(&admin, &escrow_contract_id);
+    // No identity contract here: opt into no-identity mode explicitly.
+    delivery_client.set_identity_optional(&admin, &true);
     // Issue #444: delivery::raise_dispute only accepts the configured dispute
     // contract, so the real integration flows must wire it up.
     delivery_client.set_dispute_resolution_contract(&admin, &dispute_resolution_id);
@@ -1843,6 +2107,67 @@ fn test_dispute_split_penalty_configurable() {
     assert_eq!(dispute_client.get_dispute_split_penalty(), 15);
 }
 
+/// Issue #113: the automatic 50/50 outcome produced by `force_resolve_dispute`
+/// must apply the same configured split penalty as the mediated split path.
+#[test]
+fn test_force_resolve_dispute_applies_configured_split_penalty() {
+    use identity_reputation_contract::{
+        IdentityReputationContract, IdentityReputationContractClient,
+    };
+
+    let (env, admin, sender, recipient, driver, delivery_id, escrow_id, dispute_client) =
+        setup_test();
+
+    let identity_id = env.register(IdentityReputationContract, ());
+    let identity_client = IdentityReputationContractClient::new(&env, &identity_id);
+    identity_client.init(&admin, &delivery_id, &dispute_client.address);
+    dispute_client.set_identity_reputation_contract(&admin, &identity_id);
+    identity_client.register_driver(&driver);
+    assert_eq!(
+        identity_client.get_driver_profile(&driver).reputation_score,
+        50
+    );
+
+    // Admin policy update: split penalty is no longer the default 5.
+    dispute_client.set_dispute_split_penalty(&admin, &15);
+
+    let mut delivery_record = create_mock_delivery_record(
+        &env,
+        did(30),
+        sender.clone(),
+        recipient.clone(),
+        DeliveryStatus::Active,
+        None,
+    );
+    delivery_record.driver = Some(driver.clone());
+    set_mock_delivery(&env, &delivery_id, did(30), &delivery_record);
+
+    let escrow_record = create_mock_escrow_record(
+        sender.clone(),
+        recipient.clone(),
+        driver.clone(),
+        Address::generate(&env),
+        shared_types::EscrowStatus::Locked,
+    );
+    set_mock_escrow(&env, &escrow_id, 30, &escrow_record);
+
+    let raised_at = env.ledger().timestamp();
+    dispute_client.raise_dispute(&sender, &did(30));
+    env.ledger().set_timestamp(raised_at + 604800 + 1);
+
+    dispute_client.force_resolve_dispute(&recipient, &did(30));
+    assert_eq!(
+        dispute_client.get_dispute(&did(30)).status,
+        DisputeStatus::Split
+    );
+
+    // 50 − 15 (configured), not 50 − 5 (the old hardcoded default).
+    assert_eq!(
+        identity_client.get_driver_profile(&driver).reputation_score,
+        35
+    );
+}
+
 #[test]
 fn test_reputation_config_setters_reject_out_of_bounds_values() {
     let (_env, admin, _, _, _, _, _, dispute_client) = setup_test();
@@ -1919,6 +2244,8 @@ fn test_configured_values_apply_to_split_and_pay_driver_paths() {
     escrow_client.init(&admin, &token, &0);
     escrow_client.set_dispute_resolution_contract(&admin, &dispute_resolution_id);
     delivery_client.init(&admin, &escrow_contract_id);
+    // No identity contract here: opt into no-identity mode explicitly.
+    delivery_client.set_identity_optional(&admin, &true);
     // Issue #444: delivery::raise_dispute only accepts the configured dispute
     // contract, so the real integration flows must wire it up.
     delivery_client.set_dispute_resolution_contract(&admin, &dispute_resolution_id);
@@ -1981,6 +2308,23 @@ fn test_configured_values_apply_to_split_and_pay_driver_paths() {
     assert_eq!(
         identity_client.get_driver_profile(&driver).reputation_score,
         35
+    );
+
+    // Issue #120: the split verdict's penalty event is attributable to the
+    // delivery that was split, with the split reason code.
+    let (topics, data) = last_event(&env);
+    let topic0: Symbol = Symbol::try_from_val(&env, &topics.get(0).unwrap()).unwrap();
+    assert_eq!(topic0, Symbol::new(&env, "reputation_decreased"));
+    let split_event: identity_reputation_contract::ReputationDecreasedEvent =
+        identity_reputation_contract::ReputationDecreasedEvent::try_from_val(&env, &data)
+            .expect("failed to decode ReputationDecreasedEvent");
+    assert_eq!(split_event.driver, driver);
+    assert_eq!(split_event.points, 15);
+    assert_eq!(split_event.new_score, 35);
+    assert_eq!(split_event.delivery_id, Some(split_delivery));
+    assert_eq!(
+        split_event.reason,
+        Some(identity_reputation_contract::ReputationPenaltyReason::DisputeSplit)
     );
 
     // Path 2: pay-driver resolution applies the configured reward.
@@ -2672,6 +3016,67 @@ fn test_peer_setters_publish_events() {
     assert_eq!(topic0, Symbol::new(&env, "escrow_contract_set"));
 }
 
+/// A proposal must not move the live pointer until it is confirmed after
+/// the timelock (Issue #53).
+#[test]
+fn test_peer_proposals_do_not_activate_before_confirmation() {
+    let (env, admin, _, _, _, original_delivery, original_escrow, dispute_client) = setup_test();
+
+    let new_delivery = Address::generate(&env);
+    let new_escrow = Address::generate(&env);
+    dispute_client.set_delivery_contract(&admin, &new_delivery);
+    dispute_client.set_escrow_contract(&admin, &new_escrow);
+
+    assert_eq!(dispute_client.get_delivery_contract(), original_delivery);
+    assert_eq!(dispute_client.get_escrow_contract(), original_escrow);
+    let pending_delivery = dispute_client.get_pending_delivery_contract().unwrap();
+    let pending_escrow = dispute_client.get_pending_escrow_contract().unwrap();
+    assert_eq!(pending_delivery.address, new_delivery);
+    assert_eq!(pending_escrow.address, new_escrow);
+    assert_eq!(pending_escrow.proposed_by, admin);
+    assert_eq!(
+        pending_escrow.activates_at,
+        env.ledger().timestamp() + shared_types::PEER_CONTRACT_CHANGE_TIMELOCK_SECONDS
+    );
+}
+
+/// Confirming one second before the timelock elapses is rejected; confirming
+/// exactly at `activates_at` succeeds and clears the pending slot.
+#[test]
+fn test_confirm_escrow_contract_enforces_timelock_boundary() {
+    let (env, admin, _, _, _, _, original_escrow, dispute_client) = setup_test();
+
+    let new_escrow = Address::generate(&env);
+    dispute_client.set_escrow_contract(&admin, &new_escrow);
+    let activates_at = dispute_client.get_pending_escrow_contract().unwrap().activates_at;
+
+    env.ledger().set_timestamp(activates_at - 1);
+    match dispute_client.try_confirm_escrow_contract() {
+        Err(Ok(err)) => assert_eq!(err, TrustchainError::ContractChangeTimelockNotElapsed.into()),
+        _ => panic!("Expected ContractChangeTimelockNotElapsed before activates_at"),
+    }
+    assert_eq!(dispute_client.get_escrow_contract(), original_escrow);
+
+    env.ledger().set_timestamp(activates_at);
+    dispute_client.confirm_escrow_contract();
+    assert_eq!(dispute_client.get_escrow_contract(), new_escrow);
+    assert!(dispute_client.get_pending_escrow_contract().is_none());
+}
+
+#[test]
+fn test_confirm_peer_contracts_without_pending_change_rejected() {
+    let (_, _, _, _, _, _, _, dispute_client) = setup_test();
+
+    match dispute_client.try_confirm_escrow_contract() {
+        Err(Ok(err)) => assert_eq!(err, TrustchainError::NoPendingContractChange.into()),
+        _ => panic!("Expected NoPendingContractChange for escrow"),
+    }
+    match dispute_client.try_confirm_delivery_contract() {
+        Err(Ok(err)) => assert_eq!(err, TrustchainError::NoPendingContractChange.into()),
+        _ => panic!("Expected NoPendingContractChange for delivery"),
+    }
+}
+
 #[test]
 fn test_peer_pointer_setters_extend_instance_ttl() {
     let (env, admin, _, _, _, _, _, dispute_client) = setup_test();
@@ -2943,4 +3348,55 @@ fn test_split_funds_rejects_sender_share_endpoints() {
         dispute_client.get_dispute(&did(1)).status,
         DisputeStatus::Split
     );
+}
+
+/// Issue #103 adversarial test: an admin attempts to render a verdict on a
+/// `delivery_id` for which no dispute has ever been raised against either
+/// contract. The dispute case does not exist in persistent storage, so this
+/// must fail closed with `DeliveryNotFound` rather than silently creating a
+/// verdict out of thin air or crossing into escrow's state for an unrelated
+/// delivery.
+#[test]
+#[should_panic(expected = "HostError: Error(Contract, #4)")] // TrustchainError::DeliveryNotFound
+fn test_adversarial_verdict_on_nonexistent_dispute() {
+    let (_env, admin, _sender, _recipient, _driver, _delivery_id, _escrow_id, dispute_client) =
+        setup_test();
+
+    // did(999) was never raised via raise_dispute, so no DisputeCase exists.
+    dispute_client.resolve_dispute_refund_sender(&admin, &did(999));
+}
+
+/// Issue #103 adversarial test: after an admin has already rendered a
+/// verdict (refund-sender) for a dispute, a second, conflicting verdict
+/// (pay-driver) is attempted against the *same* delivery_id. The dispute is
+/// no longer `Open`, so the double-verdict attempt must be rejected with
+/// `InvalidState` and must not be allowed to flip the already-resolved
+/// outcome or double-pay out of escrow.
+#[test]
+#[should_panic(expected = "HostError: Error(Contract, #5)")] // TrustchainError::InvalidState
+fn test_adversarial_double_verdict_conflicting_methods() {
+    let (_env, admin, sender, recipient, driver, delivery_id, escrow_id, dispute_client) =
+        setup_test();
+
+    raise_mock_dispute(
+        &sender,
+        &recipient,
+        &driver,
+        &delivery_id,
+        &escrow_id,
+        &dispute_client,
+        did(1),
+    );
+
+    // First verdict: refund the sender. This resolves the dispute.
+    dispute_client.resolve_dispute_refund_sender(&admin, &did(1));
+    assert_eq!(
+        dispute_client.get_dispute(&did(1)).status,
+        DisputeStatus::ResolvedRefund
+    );
+
+    // Second, conflicting verdict on the same dispute must be rejected
+    // outright rather than overwriting the first resolution in the driver's
+    // favor.
+    dispute_client.resolve_dispute_pay_driver(&admin, &did(1));
 }

@@ -10,6 +10,14 @@ Typed SDK for interacting with Trustchain-contracts on Stellar Soroban.
 npm install @trustchain/sdk
 ```
 
+> **Working on the SDK in this repo (contributors):** don't run `npm install`
+> inside `sdk/typescript/`. Run `npm ci` instead, so you build against the
+> exact dependency versions recorded in the committed
+> `sdk/typescript/package-lock.json` — the same lockfile-based convention the
+> Rust contracts use via `cargo build --locked` against `Cargo.lock`. See
+> [`docs/SDK_DEPENDENCY_POLICY.md`](../../docs/SDK_DEPENDENCY_POLICY.md) for
+> the full policy; `.github/workflows/ci.yml` builds the SDK the same way.
+
 ## SDK Status
 
 This package is currently a typed API preview, not a connected runtime client. The generated method signatures are present, but the underlying Soroban invocation layer is not complete in this repository snapshot. The examples below intentionally fail at runtime with a clear "not implemented" message rather than silently pretending a chain call happened.
@@ -72,6 +80,24 @@ const result = await client.createEscrow({
   amount: BigInt(1_000_000_000), // 100 XLM (assuming 7 decimals)
   fleetId: BigInt(1),
 });
+```
+
+### Create Escrows in Batch
+
+`createEscrowsBatch` returns the number of escrows created, matching the
+contract's `u32` return value. It does **not** return the created escrow IDs.
+
+```typescript
+const createdCount = await client.createEscrowsBatch({
+  sender: 'GA123...',
+  recipient: 'GB456...',
+  driver: 'GC789...',
+  token: 'CCDE...',
+  amount: BigInt(1_000_000_000),
+  deliveryIds: [BigInt(1), BigInt(2), BigInt(3)],
+});
+
+console.log(createdCount); // 3 (a number, not bigint IDs)
 ```
 
 ### Release Escrow
@@ -139,6 +165,32 @@ const fleet = await fleetClient.getFleet(fleetId);
 console.log(fleet.drivers); // ['GC789...']
 ```
 
+### Inspect Pending Fleet Changes
+
+Timelocked fleet changes can be inspected before they are confirmed. Each
+getter returns `null` when nothing is pending.
+
+```typescript
+// Identity peer queued by setIdentityContract, awaiting confirmIdentityContract
+const pendingIdentity = await fleetClient.getPendingIdentityContract();
+if (pendingIdentity && BigInt(Math.floor(Date.now() / 1000)) >= pendingIdentity.activatesAt) {
+  await fleetClient.confirmIdentityContract();
+}
+
+// Escrow peer queued by setEscrowContract, awaiting confirmEscrowContract
+const pendingEscrow = await fleetClient.getPendingEscrowContract();
+if (pendingEscrow) {
+  console.log(pendingEscrow.address, pendingEscrow.proposedBy, pendingEscrow.activatesAt); // activatesAt: bigint (unix seconds)
+}
+
+// Owner reassignment proposed by adminReassignFleetOwner, awaiting the
+// incoming owner's acceptFleetOwnerReassignment
+const pendingOwner = await fleetClient.getPendingFleetOwnerReassignment(fleetId);
+if (pendingOwner) {
+  console.log(pendingOwner.newOwner, pendingOwner.admin);
+}
+```
+
 ## Error Handling
 
 The SDK surfaces contract failures as typed error enums so callers can branch on
@@ -197,6 +249,20 @@ Create a new escrow for a delivery.
 - `params.token`: Token contract address
 - `params.amount`: Escrow amount in token units
 - `params.fleetId`: (Optional) Fleet ID if driver is part of a fleet
+
+##### `createEscrowsBatch(params: CreateEscrowsBatchParams, options?: ContractInvokeOptions): Promise<number>`
+Create multiple escrows in a single invocation. Returns the number of escrows
+created, decoded from the contract's `u32` return value.
+
+**Parameters:**
+- `params.sender`: Address funding the escrows
+- `params.recipient`: Address receiving delivery confirmation
+- `params.driver`: Address of the delivery driver
+- `params.token`: Token contract address
+- `params.amount`: Escrow amount per delivery in token units
+- `params.deliveryIds`: Delivery identifiers to create escrows for
+
+**Returns:** `Promise<number>` — count of escrows created (not escrow IDs).
 
 ##### `releaseEscrow(params: ReleaseEscrowParams, options?: ContractInvokeOptions): Promise<void>`
 Release escrowed funds to the driver after delivery confirmation.
@@ -272,6 +338,58 @@ Read the configured volume thresholds and discounts.
 ##### `getSenderVolume(sender: string): Promise<number>`
 Read a sender's accumulated volume.
 
+#### Emergency freeze
+
+Both methods move a `Locked`/`Holdback` escrow to `Paused` without moving
+funds, keep already-`Paused` escrows unchanged, reject terminal escrows with
+`InvalidState`, and remain available while the protocol is paused. Frozen
+escrows are recovered through `resolveDispute` / `resolveDisputeSplit`.
+
+##### `adminFreezeFunds(params: AdminFreezeFundsParams): Promise<void>`
+Incident-response freeze. `params.admin` must be the escrow admin
+(`Unauthorized` otherwise).
+
+##### `freezeFunds(params: FreezeFundsParams): Promise<void>`
+`params.caller` must be the configured dispute resolution contract
+(`Unauthorized` otherwise); not usable by the admin.
+
+#### Delivery peer rotation
+
+The delivery peer contract is rotated in two steps so a compromised admin key
+cannot silently redirect delivery verification:
+
+##### `proposeDeliveryContract(params: ProposeDeliveryContractParams): Promise<void>`
+Admin only. Stores `params.deliveryContract` as pending; it activates after
+the peer-contract timelock. A new proposal replaces the pending one.
+
+##### `confirmDeliveryContract(): Promise<void>`
+Permissionless. Activates the pending address once `activatesAt` has passed.
+Rejects with `NoPendingContractChange` or `ContractChangeTimelockNotElapsed`
+and leaves the active address unchanged.
+
+##### `getDeliveryContract(): Promise<string | null>`
+The active delivery contract; `null` means verification is disabled.
+
+##### `getPendingDeliveryContract(): Promise<PendingDeliveryContractInfo | null>`
+The in-flight rotation (`deliveryContract`, `proposedBy`, `activatesAt`) or
+`null`.
+
+#### Admin handover
+
+Admin rights move in two signed steps; the stored admin only changes when the
+nominee accepts.
+
+##### `proposeAdmin(params: ProposeEscrowAdminParams): Promise<void>`
+Signed by `params.currentAdmin` (must be the stored admin). Nominates
+`params.newAdmin`, replacing any earlier nomination.
+
+##### `cancelAdminProposal(params: CancelEscrowAdminProposalParams): Promise<void>`
+Signed by the current admin. Rejects with `InvalidState` if nothing is pending.
+
+##### `acceptAdmin(params: AcceptEscrowAdminParams): Promise<void>`
+Signed by `params.newAdmin`, which must equal the pending nominee
+(`Unauthorized` otherwise). Completes the transfer.
+
 ### DeliveryClient
 
 #### Methods
@@ -318,7 +436,120 @@ Confirm that a delivery has been completed.
 ##### `getDelivery(deliveryId: bigint): Promise<DeliveryRecord>`
 Get a delivery record.
 
-##### `getDriverProfile(driver: string): Promise<DeliveryDriverProfile>`
-Get the dri
+##### `setRequireKyc(params: SetRequireKycParams): Promise<void>`
+Admin only. Turns the driver KYC gate on `assign_driver` on (`required: true`)
+or off. Rejects with `Unauthorized` for non-admin callers. The gate is skipped
+while no identity contract is configured.
 
-/* … truncated 1736 chars — edit only what you need near the top … */
+##### `getRequireKyc(): Promise<boolean>`
+Read the KYC gate; defaults to `false`.
+
+##### `getDriverProfile(driver: string): Promise<DeliveryDriverProfile>`
+Get the driver's identity and reputation profile through the delivery contract.
+
+##### `getCombinedState(deliveryId: bigint): Promise<CombinedDeliveryState>`
+Get a delivery record and its optional escrow record, together with the contract's
+synchronization check.
+
+#### Peer-only dispute state operations
+
+These wrap entrypoints that the contract authorizes for a **peer contract
+address only**. In normal operation they are invoked contract-to-contract;
+the wrappers exist for integration automation, simulation and tests. The
+client throws before submitting when `caller` is not a contract (`C...`)
+address, and the contract rejects any contract other than the configured
+peer with `Unauthorized`.
+
+##### `syncDisputeFromEscrow(params: SyncDisputeFromEscrowParams): Promise<void>`
+Mark a delivery `Disputed` to mirror an administrator escrow freeze.
+`params.caller` must be the configured escrow contract; `params.reporter` is
+recorded in the `delivery_disputed` event. Valid from `Pending`, `Active`,
+`InTransit` and `Delivered`; an already `Disputed` delivery is left unchanged,
+and any other state fails with `InvalidState`.
+
+##### `resolveDispute(params: ResolveDeliveryDisputeParams): Promise<void>`
+Move a delivery from `Disputed` to `Resolved`. `params.caller` must be the
+configured dispute resolution contract. Fails with `InvalidState` when the
+delivery is not `Disputed`, and while the escrow is paused.
+
+### DisputeResolutionClient
+
+#### Methods
+
+##### Peer contract rotation
+
+Replacing the delivery or escrow contract that the dispute contract talks to
+is a two-step, timelocked change. `set*Contract` (admin only) records a
+proposal; the live pointer returned by `getDeliveryContract` /
+`getEscrowContract` does not change until `confirm*Contract` succeeds at or
+after the proposal's `activatesAt`.
+
+| Step | Delivery peer | Escrow peer |
+| --- | --- | --- |
+| Propose | `setDeliveryContract({ caller, deliveryContract })` | `setEscrowContract({ caller, escrowContract })` |
+| Inspect | `getPendingDeliveryContract()` | `getPendingEscrowContract()` |
+| Activate | `confirmDeliveryContract()` | `confirmEscrowContract()` |
+
+The inspect methods return `PendingPeerContractChange | null`. Confirming
+fails with `NoPendingContractChange` when nothing is proposed and with
+`ContractChangeTimelockNotElapsed` before `activatesAt`.
+
+##### Reputation policy
+
+The contract applies a flat reputation adjustment to the driver for each
+verdict. All three controls are admin-only and accept an integer in
+`0..=MAX_DISPUTE_REPUTATION_ADJUSTMENT` (50, half the reputation scale); the
+client throws a `RangeError` for anything else before submitting, and the
+contract rejects it with `InvalidState`.
+
+| Verdict | Setter | Getter | Default |
+| --- | --- | --- | --- |
+| Refund sender | `setDisputeReputationPenalty({ caller, penalty })` | `getDisputeReputationPenalty()` | 10 |
+| Pay driver | `setDisputeReputationReward({ caller, reward })` | `getDisputeReputationReward()` | 5 |
+| Split funds | `setDisputeSplitPenalty({ caller, penalty })` | `getDisputeSplitPenalty()` | 5 |
+
+##### `getDisputesPage(page: number, pageSize: number): Promise<bigint[]>`
+Read one page of the append-only dispute index (delivery IDs, ordered by raise
+time). The contract caps a page at 100 entries.
+
+##### `getDisputeCount(): Promise<number>`
+Total number of disputes ever recorded. This is the exact length of the index
+walked by `getDisputesPage`, so pagination is complete after
+`Math.ceil(count / pageSize)` pages:
+
+```typescript
+const count = await disputeClient.getDisputeCount();
+for (let page = 0; page * pageSize < count; page += 1) {
+  const ids = await disputeClient.getDisputesPage(page, pageSize);
+  // ...
+}
+```
+
+## Transaction preparation
+
+`ContractInvokeOptions` supports bounded polling for submitted transactions:
+`pollingIntervalMs` defaults to 1,000 ms, `pollingMaxIntervalMs` to 10,000 ms,
+and `pollingTimeoutMs` to 300,000 ms. Poll delays grow exponentially up to the
+configured maximum. An `AbortSignal` may be passed as `signal` to stop waiting.
+The existing `timeout` option configures the RPC request timeout.
+
+For signed contract calls, transaction simulation inspects persistent contract
+storage and contract-code entries in the transaction footprint. Entries with
+at most `ttlThresholdLedgers` remaining (default 100,000) are extended in a
+separate transaction to at least `ttlExtendToLedgers` (default 518,400) before
+the invocation is submitted. Both values are configurable; the extension target
+must be greater than the threshold.
+
+## Testing
+
+```bash
+npm run test
+```
+
+## Contributing
+
+See [CONTRIBUTING.md](../../CONTRIBUTING.md) for contribution guidelines.
+
+## License
+
+MIT

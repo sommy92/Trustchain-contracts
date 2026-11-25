@@ -27,6 +27,9 @@ pub enum DataKey {
     DisputeContract,
     EscrowContract,
     ReputationConfig,
+    /// Marks a `(driver, delivery_id)` pair as already credited so a delivery
+    /// can only ever award reputation once (Issue #118).
+    CreditedDelivery(Address, u64),
 }
 
 #[contracttype]
@@ -80,6 +83,38 @@ fn require_escrow_not_paused(env: &Env) {
     }
 }
 
+/// Extend the TTL of a peer contract's `AuthorizedContract` grant and of the
+/// instance (which holds the delivery/dispute peer addresses).
+fn renew_authorized_contract(env: &Env, contract_addr: &Address) {
+    env.storage().persistent().extend_ttl(
+        &DataKey::AuthorizedContract(contract_addr.clone()),
+        ttl::LEDGER_TTL_THRESHOLD,
+        ttl::LEDGER_TTL_EXTEND_TO,
+    );
+    env.storage()
+        .instance()
+        .extend_ttl(ttl::LEDGER_TTL_THRESHOLD, ttl::LEDGER_TTL_EXTEND_TO);
+}
+
+/// Require that `caller` holds an `AuthorizedContract` grant, and renew the
+/// grant while it is being used.
+///
+/// Grants are persistent entries with their own TTL. Previously they were
+/// only extended when `set_authorized_contract` wrote them, so a delivery or
+/// dispute peer that kept calling the reputation entry points every day could
+/// still have its grant archived once that one-off extension ran out, after
+/// which it would lose permission until an admin re-granted it. Renewing on
+/// every authorized use ties the grant's lifetime to the peer's activity; a
+/// grant that is genuinely unused still ages out normally. Unauthorized
+/// callers fail before any write, and the `is_authorized_contract` query
+/// remains read-only (Issue #392).
+fn require_authorized_contract(env: &Env, caller: &Address) {
+    if !IdentityReputationContract::is_authorized_contract(env.clone(), caller.clone()) {
+        panic_with_error!(env, TrustchainError::Unauthorized);
+    }
+    renew_authorized_contract(env, caller);
+}
+
 /// A suspended driver's profile is frozen for audit purposes: the reputation
 /// minting entry points (`increase_reputation`, `award_reputation`) must
 /// reject updates while `DriverStatus::Suspended` is set.  Penalties
@@ -93,6 +128,32 @@ fn require_driver_not_suspended(env: &Env, profile: &DriverProfile) {
     }
 }
 
+/// Atomically move reputation-writer authorization from `old_peer` to
+/// `new_peer`.
+///
+/// Peer rotation must keep the active peer address and the reputation
+/// allowlist in sync (Issue #117): the retired peer loses its
+/// `AuthorizedContract` flag in the same call that grants it to the
+/// replacement, so there is never a window where both (or neither) are
+/// authorized. Revocation of the replaced peer therefore takes effect
+/// immediately at confirmation time.
+fn rotate_authorized_peer(env: &Env, old_peer: &Address, new_peer: &Address) {
+    if old_peer == new_peer {
+        // No-op rotation: keep the existing grant untouched.
+        return;
+    }
+    env.storage()
+        .persistent()
+        .remove(&DataKey::AuthorizedContract(old_peer.clone()));
+    let key = DataKey::AuthorizedContract(new_peer.clone());
+    env.storage().persistent().set(&key, &true);
+    env.storage().persistent().extend_ttl(
+        &key,
+        ttl::LEDGER_TTL_THRESHOLD,
+        ttl::LEDGER_TTL_EXTEND_TO,
+    );
+}
+
 #[contract]
 pub struct IdentityReputationContract;
 
@@ -103,6 +164,9 @@ impl IdentityReputationContract {
             panic_with_error!(&env, TrustchainError::AlreadyInitialized);
         }
         admin.require_auth();
+        // Issue #94: admin, delivery_contract and dispute_contract must all
+        // be distinct, non-self addresses before any is persisted.
+        shared_types::validate_init_addresses(&env, &[&admin, &delivery_contract, &dispute_contract]);
         env.storage().instance().set(&StorageKey::Admin, &admin);
         env.storage()
             .instance()
@@ -113,14 +177,12 @@ impl IdentityReputationContract {
 
         // Register the initial two authorized contracts through the allowlist so
         // they can be revoked or rotated later without a contract migration.
+        // Grants are renewed on every authorized use afterwards.
         for contract_addr in [delivery_contract, dispute_contract] {
-            let key = DataKey::AuthorizedContract(contract_addr);
-            env.storage().persistent().set(&key, &true);
-            env.storage().persistent().extend_ttl(
-                &key,
-                ttl::LEDGER_TTL_THRESHOLD,
-                ttl::LEDGER_TTL_EXTEND_TO,
-            );
+            env.storage()
+                .persistent()
+                .set(&DataKey::AuthorizedContract(contract_addr.clone()), &true);
+            renew_authorized_contract(&env, &contract_addr);
         }
     }
 
@@ -148,11 +210,7 @@ impl IdentityReputationContract {
         let key = DataKey::AuthorizedContract(contract_addr.clone());
         if authorized {
             env.storage().persistent().set(&key, &true);
-            env.storage().persistent().extend_ttl(
-                &key,
-                ttl::LEDGER_TTL_THRESHOLD,
-                ttl::LEDGER_TTL_EXTEND_TO,
-            );
+            renew_authorized_contract(&env, &contract_addr);
         } else {
             env.storage().persistent().remove(&key);
         }
@@ -227,7 +285,7 @@ impl IdentityReputationContract {
             ttl::LEDGER_TTL_EXTEND_TO,
         );
         env.events().publish(
-            (soroban_sdk::Symbol::new(&env, "delivery_contract_change_proposed"),),
+            (soroban_sdk::Symbol::new(&env, "delivery_contract_proposed"),),
             (admin, delivery_contract, activates_at),
         );
     }
@@ -241,6 +299,20 @@ impl IdentityReputationContract {
             .unwrap_or_else(|| panic_with_error!(&env, TrustchainError::NoPendingContractChange));
         if env.ledger().timestamp() < pending.activates_at {
             panic_with_error!(&env, TrustchainError::ContractChangeTimelockNotElapsed);
+        }
+        let old_delivery_contract: Option<Address> =
+            env.storage().instance().get(&DataKey::DeliveryContract);
+        if let Some(old_peer) = old_delivery_contract {
+            rotate_authorized_peer(&env, &old_peer, &pending.address);
+        } else {
+            // No previous peer recorded: grant the new peer directly.
+            let key = DataKey::AuthorizedContract(pending.address.clone());
+            env.storage().persistent().set(&key, &true);
+            env.storage().persistent().extend_ttl(
+                &key,
+                ttl::LEDGER_TTL_THRESHOLD,
+                ttl::LEDGER_TTL_EXTEND_TO,
+            );
         }
         env.storage()
             .instance()
@@ -270,6 +342,20 @@ impl IdentityReputationContract {
         if !is_admin(&env, &admin) {
             panic_with_error!(&env, TrustchainError::Unauthorized);
         }
+        let old_dispute_contract: Option<Address> =
+            env.storage().instance().get(&DataKey::DisputeContract);
+        if let Some(old_peer) = old_dispute_contract {
+            rotate_authorized_peer(&env, &old_peer, &dispute_contract);
+        } else {
+            // No previous peer recorded: grant the new peer directly.
+            let key = DataKey::AuthorizedContract(dispute_contract.clone());
+            env.storage().persistent().set(&key, &true);
+            env.storage().persistent().extend_ttl(
+                &key,
+                ttl::LEDGER_TTL_THRESHOLD,
+                ttl::LEDGER_TTL_EXTEND_TO,
+            );
+        }
         env.storage()
             .instance()
             .set(&DataKey::DisputeContract, &dispute_contract);
@@ -297,12 +383,20 @@ impl IdentityReputationContract {
         let key = DataKey::AuthorizedContract(contract_addr);
         // Read-only check: TTL extension is intentionally omitted here.
         // Extending TTL inside a query function incurs unexpected write fees
-        // and violates read-only semantics (Issue #392). TTL extension happens
-        // in set_authorized_contract, which is the only mutating path for
-        // authorization data.
+        // and violates read-only semantics (Issue #392). Grants are renewed
+        // by set_authorized_contract and by every authorized use of a
+        // reputation entry point (see `require_authorized_contract`).
         env.storage().persistent().get(&key).unwrap_or(false)
     }
 
+    /// Read-only existence check for a driver profile.
+    ///
+    /// Like `get_driver_profile`, this deliberately does **not** extend the
+    /// profile's TTL (Issue #392). An *archived* profile is not a missing
+    /// one: Soroban keeps archived persistent entries and restores them when
+    /// a transaction's footprint includes them, so a simulated call reports
+    /// that a restore is required rather than returning `false`. See
+    /// `extend_driver_profile_ttl` for the recovery path.
     pub fn has_driver_profile(env: Env, driver: Address) -> bool {
         let key = DataKey::DriverProfile(driver);
         env.storage()
@@ -320,11 +414,21 @@ impl IdentityReputationContract {
     /// no-op — while removing the `AlreadyInitialized` panic that forced
     /// cross-contract callers (e.g. `fleet_management_contract::register_fleet`)
     /// to defend with their own `has_driver_profile` pre-checks.
+    ///
+    /// Archival recovery: when a returning driver calls this after a long
+    /// absence, their (restored) profile is returned with its history intact
+    /// and its TTL is extended, so the profile cannot silently lapse into
+    /// archival again right after the driver comes back.
     #[allow(deprecated)] // events().publish() is deprecated in SDK 27.0.0 but still functional; tracked in SOROBAN_SDK_27_MIGRATION.md#event-system-migration (Issue #114)
     pub fn register_driver(env: Env, driver: Address) -> DriverProfile {
         driver.require_auth();
         let key = DataKey::DriverProfile(driver.clone());
         if let Some(existing) = env.storage().persistent().get::<_, DriverProfile>(&key) {
+            env.storage().persistent().extend_ttl(
+                &key,
+                ttl::LEDGER_TTL_THRESHOLD,
+                ttl::LEDGER_TTL_EXTEND_TO,
+            );
             return existing;
         }
 
@@ -401,6 +505,36 @@ impl IdentityReputationContract {
         env.storage().persistent().has(&key)
     }
 
+    /// Extend the TTL of an existing driver profile so it is not archived.
+    ///
+    /// Read paths (`get_driver_profile`, `has_driver_profile`,
+    /// `is_driver_suspended`) never extend TTL (Issue #392), so a driver who
+    /// is registered but inactive for longer than `LEDGER_TTL_EXTEND_TO`
+    /// ledgers would otherwise have their profile archived. This entry point
+    /// is permissionless — anyone may pay to keep a profile live (a keeper,
+    /// a fleet operator, or the driver) — and it never changes the profile's
+    /// contents, so it grants no capability beyond paying rent.
+    ///
+    /// If the profile is already archived, the submitting transaction must
+    /// include it in its footprint, which restores it (simulation adds the
+    /// restore automatically on protocol 23+). Returns the profile.
+    ///
+    /// Panics with `ProviderNotFound` when no profile was ever registered.
+    pub fn extend_driver_profile_ttl(env: Env, driver: Address) -> DriverProfile {
+        let key = DataKey::DriverProfile(driver);
+        let profile: DriverProfile = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, TrustchainError::ProviderNotFound));
+        env.storage().persistent().extend_ttl(
+            &key,
+            ttl::LEDGER_TTL_THRESHOLD,
+            ttl::LEDGER_TTL_EXTEND_TO,
+        );
+        profile
+    }
+
     pub fn get_driver_profile(env: Env, driver: Address) -> DriverProfile {
         let key = DataKey::DriverProfile(driver);
         let profile: DriverProfile = env
@@ -451,6 +585,11 @@ impl IdentityReputationContract {
     ///
     /// Rejected with `InvalidState` while the driver is suspended — a frozen
     /// profile must not gain reputation until `reinstate_driver` restores it.
+    ///
+    /// Each `(driver, delivery_id)` pair is credited at most once: a replayed
+    /// delivery ID is rejected with `DuplicateDelivery` before any state is
+    /// mutated, so neither the score nor `deliveries_completed` can be inflated
+    /// by a buggy or newly allowlisted caller (Issue #118).
     #[allow(deprecated)] // events().publish() is deprecated in SDK 27.0.0 but still functional; tracked in SOROBAN_SDK_27_MIGRATION.md#event-system-migration (Issue #114)
     pub fn increase_reputation(
         env: Env,
@@ -465,9 +604,7 @@ impl IdentityReputationContract {
         if caller != delivery_contract && caller != dispute_contract {
             require_escrow_not_paused(&env);
         }
-        if !Self::is_authorized_contract(env.clone(), caller.clone()) {
-            panic_with_error!(&env, TrustchainError::Unauthorized);
-        }
+        require_authorized_contract(&env, &caller);
         caller.require_auth();
 
         let key = DataKey::DriverProfile(driver.clone());
@@ -478,6 +615,14 @@ impl IdentityReputationContract {
             .unwrap_or_else(|| panic_with_error!(&env, TrustchainError::ProviderNotFound));
 
         require_driver_not_suspended(&env, &profile);
+
+        // Issue #118: reject replays before touching any state. The marker is
+        // only written after every validation below has passed, so a failed
+        // call never marks a delivery as credited.
+        let credited_key = DataKey::CreditedDelivery(driver.clone(), delivery_id);
+        if env.storage().persistent().has(&credited_key) {
+            panic_with_error!(&env, TrustchainError::DuplicateDelivery);
+        }
 
         let config = Self::get_reputation_config(env.clone());
 
@@ -499,12 +644,23 @@ impl IdentityReputationContract {
             points = points.saturating_add(config.fragile_points);
         }
 
-        profile.reputation_score = reputation_up(profile.reputation_score, points);
+        let old_score = profile.reputation_score;
+        let new_score = reputation_up(old_score, points);
+        let applied_delta = new_score.saturating_sub(old_score);
+        profile.reputation_score = new_score;
         profile.deliveries_completed += 1;
 
         env.storage().persistent().set(&key, &profile);
         env.storage().persistent().extend_ttl(
             &key,
+            ttl::LEDGER_TTL_THRESHOLD,
+            ttl::LEDGER_TTL_EXTEND_TO,
+        );
+
+        // Record the credited delivery so it can never be replayed.
+        env.storage().persistent().set(&credited_key, &true);
+        env.storage().persistent().extend_ttl(
+            &credited_key,
             ttl::LEDGER_TTL_THRESHOLD,
             ttl::LEDGER_TTL_EXTEND_TO,
         );
@@ -515,8 +671,16 @@ impl IdentityReputationContract {
                 driver,
                 delivery_id,
                 points,
+                applied_delta,
+                new_score,
             },
         );
+    }
+
+    /// Returns `true` if `delivery_id` has already credited `driver`.
+    pub fn is_delivery_credited(env: Env, driver: Address, delivery_id: u64) -> bool {
+        let key = DataKey::CreditedDelivery(driver, delivery_id);
+        env.storage().persistent().has(&key)
     }
 
     /// Penalize a driver by `points` (e.g. after an adverse dispute ruling).
@@ -525,16 +689,28 @@ impl IdentityReputationContract {
     /// land while a driver is suspended, otherwise suspension would shield
     /// wrongdoers from punishment. Only the reputation-minting entry points
     /// (`increase_reputation`, `award_reputation`) freeze on suspension.
+    ///
+    /// The emitted `ReputationDecreasedEvent` carries the dispute context so
+    /// indexers can attribute the penalty to the case that caused it:
+    /// `delivery_id` identifies the delivery under dispute, `reason` is a
+    /// caller-supplied reason code (e.g. the dispute ruling), `actor` is the
+    /// authenticated caller that applied the penalty, and `resulting_score` is
+    /// the driver's reputation score after the deduction.
     #[allow(deprecated)] // events().publish() is deprecated in SDK 27.0.0 but still functional; tracked in SOROBAN_SDK_27_MIGRATION.md#event-system-migration (Issue #114)
-    pub fn decrease_reputation(env: Env, caller: Address, driver: Address, points: u32) {
+    pub fn decrease_reputation(
+        env: Env,
+        caller: Address,
+        driver: Address,
+        delivery_id: u64,
+        points: u32,
+        reason: u32,
+    ) {
         let delivery_contract = Self::get_delivery_contract(env.clone());
         let dispute_contract = Self::get_dispute_contract(env.clone());
         if caller != delivery_contract && caller != dispute_contract {
             require_escrow_not_paused(&env);
         }
-        if !Self::is_authorized_contract(env.clone(), caller.clone()) {
-            panic_with_error!(&env, TrustchainError::Unauthorized);
-        }
+        require_authorized_contract(&env, &caller);
         caller.require_auth();
 
         let key = DataKey::DriverProfile(driver.clone());
@@ -545,6 +721,7 @@ impl IdentityReputationContract {
             .unwrap_or_else(|| panic_with_error!(&env, TrustchainError::ProviderNotFound));
 
         profile.reputation_score = reputation_down(profile.reputation_score, points);
+        let resulting_score = profile.reputation_score;
 
         env.storage().persistent().set(&key, &profile);
         env.storage().persistent().extend_ttl(
@@ -555,7 +732,14 @@ impl IdentityReputationContract {
 
         env.events().publish(
             (events::reputation_decreased(&env),),
-            ReputationDecreasedEvent { driver, points },
+            ReputationDecreasedEvent {
+                driver,
+                delivery_id,
+                points,
+                reason,
+                actor: caller,
+                resulting_score,
+            },
         );
     }
 
@@ -576,9 +760,7 @@ impl IdentityReputationContract {
         if caller != delivery_contract && caller != dispute_contract {
             require_escrow_not_paused(&env);
         }
-        if !Self::is_authorized_contract(env.clone(), caller.clone()) {
-            panic_with_error!(&env, TrustchainError::Unauthorized);
-        }
+        require_authorized_contract(&env, &caller);
         caller.require_auth();
 
         let key = DataKey::DriverProfile(driver.clone());
@@ -590,7 +772,10 @@ impl IdentityReputationContract {
 
         require_driver_not_suspended(&env, &profile);
 
-        profile.reputation_score = reputation_up(profile.reputation_score, points);
+        let old_score = profile.reputation_score;
+        let new_score = reputation_up(old_score, points);
+        let applied_delta = new_score.saturating_sub(old_score);
+        profile.reputation_score = new_score;
 
         env.storage().persistent().set(&key, &profile);
         env.storage().persistent().extend_ttl(
@@ -601,7 +786,12 @@ impl IdentityReputationContract {
 
         env.events().publish(
             (events::reputation_awarded(&env),),
-            ReputationAwardedEvent { driver, points },
+            ReputationAwardedEvent {
+                driver,
+                points,
+                applied_delta,
+                new_score,
+            },
         );
     }
 
@@ -617,9 +807,18 @@ impl IdentityReputationContract {
         }
     }
 
+    /// Returns `true` when the driver is eligible for enterprise work.
+    ///
+    /// Eligibility reflects **both** the reputation score threshold
+    /// (`ENTERPRISE_THRESHOLD`) and the driver's current operational status:
+    /// a driver whose `DriverProfile.status` is `DriverStatus::Suspended` is
+    /// ineligible regardless of how high their score is.  Suspension is stored
+    /// separately from the score, so checking the score alone would let a
+    /// suspended high-score driver appear eligible to integrations relying on
+    /// this view.
     pub fn is_eligible_for_enterprise(env: Env, driver: Address) -> bool {
         let profile = Self::get_driver_profile(env, driver);
-        profile.reputation_score >= ENTERPRISE_THRESHOLD
+        profile.status == DriverStatus::Active && profile.reputation_score >= ENTERPRISE_THRESHOLD
     }
 
     // ── Driver suspension lifecycle ───────────────────────────────────────────
@@ -641,10 +840,8 @@ impl IdentityReputationContract {
     #[allow(deprecated)] // events().publish() is deprecated in SDK 27.0.0 but still functional
     pub fn suspend_driver(env: Env, caller: Address, driver: Address) {
         caller.require_auth();
-        if !is_admin(&env, &caller)
-            && !Self::is_authorized_contract(env.clone(), caller.clone())
-        {
-            panic_with_error!(&env, TrustchainError::Unauthorized);
+        if !is_admin(&env, &caller) {
+            require_authorized_contract(&env, &caller);
         }
 
         let key = DataKey::DriverProfile(driver.clone());

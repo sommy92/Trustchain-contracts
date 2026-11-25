@@ -60,6 +60,15 @@ non-paginated sender/recipient/driver getters are convenient for small indexes
 but return at most the first 100 records; use the page methods to enumerate
 larger indexes.
 
+**Index storage lifetime.** Each index is stored as 64-ID pages
+(`EscrowIndex` / `DeliveryIndex`) plus a length counter (`EscrowIndexLen` /
+`DeliveryIndexLen`), all persistent. Appending an ID extends the page it
+writes and the length together to `LEDGER_TTL_EXTEND_TO`, and every read
+extends the length and each page it returns IDs from. A full page is never
+written again, so long-idle history is kept alive by reading it (e.g. a
+periodic keeper walking `get_escrows_page` / `get_deliveries_page`); the
+length and the pages in use never expire apart.
+
 ### Interim: Event-Replay Indexing
 
 For off-chain applications requiring advanced queries (e.g., deliveries in a specific date range, by cargo category, or paginated results), the recommended interim approach is **event-replay indexing**:
@@ -316,12 +325,35 @@ When configured, both creation entry points:
 2. Verify the supplied `recipient` matches the delivery record.
 3. Verify the supplied `driver` matches the delivery record's driver **if** a
    driver has already been assigned (`assign_driver` has been called). If the
-   driver field is still `None` the check is deferred — escrow creation may
-   precede driver assignment.
+   driver field is still `None` the check is deferred to `assign_driver`,
+   which rejects any driver other than the funded escrow's driver
+   (`EscrowDriverMismatch`).
 
-When **not** configured (i.e. `get_delivery_contract` returns `None`), both
-functions behave exactly as before this change, making the check fully opt-in
-for existing deployments.
+When **not** configured (i.e. `get_delivery_contract` returns `None`, which
+includes the period while a proposed address is still in its timelock), both
+functions **fail closed** with `DeliveryContractNotConfigured` unless the admin
+has explicitly enabled standalone mode (see `set_standalone_mode`).
+
+#### `set_standalone_mode`
+Explicitly opt a deployment in or out of standalone mode, in which escrows are
+created without a backing delivery contract and delivery verification is
+skipped. Off by default.
+
+**Parameters:**
+- `admin: Address` - Protocol admin
+- `enabled: bool` - Whether standalone mode is on
+
+**Authorization:** Admin only
+
+**Errors:**
+- `Unauthorized` - Caller is not the admin
+- `InvalidState` - `enabled = true` while a delivery contract is active
+
+**Events:** `standalone_mode_set` with `(admin, enabled)`
+
+Activation is one-way: `confirm_delivery_contract` clears standalone mode, and
+it cannot be re-enabled while a delivery contract is active. `is_standalone_mode`
+returns the current flag.
 
 **Design note:** the check adds one `get_delivery` cross-contract call to the
 escrow-creation hot path. The integrity benefit — preventing orphaned escrows and
@@ -340,7 +372,7 @@ leave the delivery contract unconfigured.
 - `Unauthorized` - Caller is not the configured admin
 - `NotInitialized` - Contract has not been initialised
 
-**Events:** `delivery_contract_change_proposed`; confirmation emits
+**Events:** `delivery_contract_proposed`; confirmation emits
 `delivery_contract_updated`.
 
 #### `confirm_delivery_contract`
@@ -475,6 +507,8 @@ Lock funds for a delivery.
 **Errors:**
 - `DuplicateDelivery` - Escrow already exists for this delivery_id
 - `InsufficientFunds` - Sender balance too low
+- `ArithmeticOverflow` - Adding `amount` to `get_total_locked(token)` would exceed
+  `i128::MAX`; the deposit is rejected before any funds are transferred
 
 **Events:** `escrow_funded`
 
@@ -673,6 +707,13 @@ and receive approval from two distinct mediators.
 - `Unauthorized` - Caller not admin
 - `InvalidState` - Escrow not in Paused state
 - `InvalidFee` - sender_share_bps > 10000
+- `ArithmeticOverflow` - Defensive: the basis-point share could not be computed
+  exactly (not reachable for a valid, non-negative escrow amount)
+
+The sender share is `floor(amount * sender_share_bps / 10000)`, computed without
+forming the full product, so it is exact for every escrow amount up to
+`i128::MAX`. The driver receives `amount - sender_share` minus the platform fee;
+the three legs always sum to the escrowed amount.
 
 **Events:** `dispute_resolved`
 
@@ -935,6 +976,13 @@ Returns the total amount of `token` currently locked across all escrows. This
 is the key metric referenced by `docs/MONITORING.md` and the basis for
 `get_untracked_balance` / `sweep_untracked_balance`.
 
+The underlying `TotalLocked` persistent entry has its TTL extended to
+`LEDGER_TTL_EXTEND_TO` on every escrow creation (single and batch), every
+settlement (release, refund, dispute resolution, reclaim) and every read
+through this getter, so the liability counter cannot expire while the escrows
+it tracks are still live. Returns `0` only for a token that has never been
+locked.
+
 **Parameters:**
 - `token: Address` - The token to query
 
@@ -944,6 +992,12 @@ is the key metric referenced by `docs/MONITORING.md` and the basis for
 Returns the sender's payout count, incremented each time a payout is executed
 for the sender, used to select the applicable volume-discount tier. Returns `0`
 for a sender with no payouts yet.
+
+The counter is capped at `constants::MAX_SENDER_VOLUME` (`u32::MAX`). Payouts
+for a sender already at the cap still settle normally, but the count stays at
+the cap and each such payout publishes a `sender_volume_capped` event
+(`SenderVolumeCapped { sender, volume }`) so the boundary is visible to
+indexers instead of the counter silently stopping.
 
 **Parameters:**
 - `sender: Address` - Sender address
@@ -1003,6 +1057,8 @@ the same token and amount validation as `create_escrow`.
 - `InvalidAmount` - Any element's amount is not positive
 - `DuplicateDelivery` - Escrow already exists for any delivery_id
 - `BatchTooLarge` - Batch size exceeds 100
+- `ArithmeticOverflow` - The running `TotalLocked` (existing total plus the batch
+  elements so far) would exceed `i128::MAX`; the entire batch is aborted
 
 **Events:** `escrow_funded` (once per escrow)
 
@@ -1200,8 +1256,9 @@ Assign a driver to a delivery.
 - `NotAuthorized` - Caller not admin or driver
 - `DeliveryNotFound` - Invalid delivery_id
 - `InvalidState` - Delivery not in Pending state
-- `ProviderNotFound` - KYC enforcement enabled, identity contract configured, and the driver has no profile
-- `Unauthorized` - KYC enforcement enabled and `driver.kyc_verified` is `false`
+- `ProviderNotFound` - Identity contract configured and the driver has no profile
+- `Unauthorized` - Driver is suspended, or KYC enforcement enabled and `driver.kyc_verified` is `false`
+- `IdentityNotConfigured` - No identity contract configured and no-identity mode not enabled (or `require_kyc` is `true`)
 
 **Events:** `driver_assigned`
 
@@ -1209,14 +1266,20 @@ Assign a driver to a delivery.
 - Sets delivery.driver to specified address
 - Updates status to Active
 
+**Identity integration policy:**
+When an identity contract is configured, `assign_driver` requires the driver
+to have a profile (`has_driver_profile`) that is not suspended. When none is
+configured, `assign_driver` **fails closed** with `IdentityNotConfigured`,
+unless the admin has deliberately enabled no-identity mode with
+`set_identity_optional(admin, true)`. Without this, a partially configured
+deployment would accept arbitrary driver addresses.
+
 **KYC Gate (Issue #314):**
-When `require_kyc` is `true` (set via `set_require_kyc`) **and** the identity
-contract is configured, `assign_driver` cross-calls
-`identity_reputation_contract::has_driver_profile` and
-`get_driver_profile` to confirm the driver exists and has `kyc_verified = true`.
-The gate is silently skipped when no identity contract is configured, so
-deployments that have not wired one up continue to work even with the flag set.
-The default is `false` (gate disabled), preserving all existing flows.
+When `require_kyc` is `true` (set via `set_require_kyc`), `assign_driver`
+also requires `kyc_verified = true` on the driver's profile. KYC cannot be
+checked without an identity contract, so with `require_kyc` set and no
+identity contract, assignment fails with `IdentityNotConfigured` even in
+no-identity mode. The default is `false` (gate disabled).
 
 **Example:**
 ```rust
@@ -1241,8 +1304,34 @@ Enable or disable the KYC gate on `assign_driver` (Issue #314).
 **Notes:**
 - Default is `false` (enforcement disabled).  Existing flows are unaffected
   until an admin explicitly enables this.
-- The gate is silently skipped when no identity contract is configured,
-  even when `required` is `true`.
+- With no identity contract configured, `assign_driver` fails with
+  `IdentityNotConfigured` while `required` is `true`.
+
+#### `set_identity_optional`
+Explicitly enable or disable no-identity mode for `assign_driver`.
+
+**Parameters:**
+- `admin: Address` - Admin address
+- `optional: bool` - `true` to allow assignment without an identity contract
+
+**Authorization:** Admin only
+
+**Events:** `identity_optional_updated` with data `(admin, optional)`
+
+**Notes:**
+- Default is `false`: without an identity contract, `assign_driver` fails
+  closed with `IdentityNotConfigured`.
+- Only matters while no identity contract is configured; once one is set,
+  registration, suspension, and KYC checks always apply.
+
+#### `get_identity_optional`
+Return whether no-identity mode is enabled.
+
+**Parameters:** None
+
+**Returns:** `bool`
+
+**Authorization:** None required
 
 #### `get_require_kyc`
 Return the current KYC-enforcement setting (Issue #314).
@@ -1262,9 +1351,16 @@ Driver marks delivery as actively in transit.
 
 **Authorization:** Assigned driver only
 
+**Preconditions:** The escrow stored under `delivery_id` must fund this
+delivery: its `delivery_id`, `sender`, `recipient` and `driver` must all match
+the delivery record, and it must be `Locked`.
+
 **Errors:**
 - `NotAuthorized` - Caller is not assigned driver
 - `InvalidState` - Delivery not in Active state
+- `DeliveryNotFound` - No escrow exists for the delivery
+- `EscrowMismatch` - The escrow's delivery ID, sender, recipient or driver does not match the delivery
+- `EscrowNotLocked` - The matching escrow is not `Locked`
 
 **Events:** `DeliveryInTransit`
 
@@ -1290,6 +1386,12 @@ Recipient confirms successful delivery.
 - `NotAuthorized` - Caller is not recipient
 - `InvalidState` - Delivery not in InTransit state
 - `EscrowNotConfigured` - Escrow contract not set
+- `EscrowPartyMismatch` - The escrow for this delivery ID is bound to a different driver, sender, or recipient than the delivery record; nothing is changed
+
+Before moving the escrow to holdback, the contract reads the escrow and
+requires its `driver`, `sender`, and `recipient` to equal the delivery's
+assigned driver, sender, and recipient. This prevents a delivery from being
+marked complete while escrow pays (and reputation credits) a different driver.
 
 **Events:** `delivery_confirmed`
 
@@ -1306,7 +1408,10 @@ delivery_contract.confirm_delivery(&recipient, &delivery_id);
 ```
 
 #### `cancel_delivery`
-Sender cancels a delivery.
+Sender cancels a delivery. Only allowed while the delivery is `Pending` or
+`Active`; once the driver has called `mark_in_transit` the sender can no longer
+cancel. An in-transit delivery can only end through `confirm_delivery`, a
+dispute, or `reclaim_delivery_expired_escrow` after the escrow expires.
 
 **Parameters:**
 - `sender: Address` - Sender address
@@ -1316,7 +1421,16 @@ Sender cancels a delivery.
 
 **Errors:**
 - `NotAuthorized` - Caller is not sender
+- `TransitAlreadyStarted` - Delivery is `InTransit`; the driver already has custody
 - `InvalidState` - Invalid state transition
+- `EscrowNotLocked` - The sender's escrow is paused, in holdback or settled
+
+**Escrow handling:** the escrow under `delivery_id` is refunded only when its
+`delivery_id` and `sender` match this delivery and it is `Locked`; the
+`delivery_cancelled` event then reports its amount. A foreign escrow or an
+already-refunded escrow is left alone, `refund_amount` is `0`, and a
+`cancel_escrow_skipped` event is published with reason `foreign_escrow` or
+`already_refunded`. With no escrow, `refund_amount` is `0`.
 
 **Events:** `delivery_cancelled`
 
@@ -1742,6 +1856,39 @@ Configure the identity/reputation contract address used for reputation penalties
 
 **Errors:**
 - `Unauthorized` - Caller is not an admin
+
+#### `set_delivery_contract` / `set_escrow_contract` (dispute resolution)
+Propose a new delivery or escrow peer address for the dispute contract. The
+setter only records a `PendingPeerContractChange` with
+`activates_at = now + PEER_CONTRACT_CHANGE_TIMELOCK_SECONDS` (three days); the
+active `DeliveryContract` / `EscrowContract` pointer is **not** modified, so
+cross-contract calls keep targeting the current peer during the review window.
+A new proposal replaces any earlier pending one.
+
+**Parameters:**
+- `caller: Address` - Dispute admin
+- `delivery_contract` / `escrow_contract: Address` - Proposed peer address
+
+**Authorization:** Dispute admin only
+
+**Events:** `delivery_contract_proposed` / `escrow_contract_change_proposed`
+with `(caller, address, activates_at)`
+
+**Errors:**
+- `Unauthorized` - Caller is not a dispute admin
+
+#### `confirm_delivery_contract` / `confirm_escrow_contract` (dispute resolution)
+Permissionless. Switches the active pointer to the pending address once
+`activates_at` has been reached and clears the proposal, so a proposal is
+applied exactly once. Query pending state with `get_pending_delivery_contract`
+/ `get_pending_escrow_contract`.
+
+**Events:** `delivery_contract_set` / `escrow_contract_set` with
+`(proposed_by, address)`
+
+**Errors:**
+- `NoPendingContractChange` - No proposal is pending (including a second confirm)
+- `ContractChangeTimelockNotElapsed` - Called before `activates_at`
 
 #### `set_escrow_contract`
 Repoint the escrow contract this delivery contract cross-calls for every
@@ -2183,8 +2330,13 @@ pub enum DriverFleetStatus {
     Pending,  // Driver invited but has not yet accepted
     Active,   // Driver accepted and is an active fleet member
     Removed,  // Driver was removed from the fleet history
+    Expired,  // Invited, but the acceptance window elapsed (reported, never stored)
 }
 ```
+
+`Expired` is computed by `get_driver_fleet_status` for a `Pending` invite older
+than `INVITE_ACCEPTANCE_WINDOW_SECONDS` (7 days); `None` still means the driver
+was never invited.
 
 #### `FleetProfile`
 ```rust
@@ -2214,7 +2366,7 @@ Initialize the fleet management contract.
 
 **State Changes:**
 - Sets the protocol admin
-- Resets the fleet counter to `0`
+- Resets the fleet counter to `0` and extends its TTL (and the instance TTL) to `LEDGER_TTL_EXTEND_TO`
 
 #### `set_identity_contract`
 Propose the identity/reputation contract used for automatic driver profile
@@ -2242,6 +2394,27 @@ Apply the pending identity contract after its three-day review period.
 
 **Errors:** `NoPendingContractChange`, `ContractChangeTimelockNotElapsed`
 
+#### `set_identity_optional` (fleet)
+Explicitly enable or disable no-identity mode for driver invitations and
+acceptances.
+
+**Parameters:**
+- `admin: Address` - Admin address
+- `optional: bool` - `true` to allow `add_driver_to_fleet` / `accept_fleet_invite` without an identity contract
+
+**Authorization:** Admin only
+
+**Events:** `identity_optional_updated` with data `(admin, optional)`
+
+**Notes:**
+- Default is `false`: while no identity contract is configured, both entry
+  points fail closed with `IdentityNotConfigured`.
+- Only matters while no identity contract is configured; once one is
+  confirmed, registration is always required.
+
+#### `get_identity_optional` (fleet)
+Return whether no-identity mode is enabled. **Returns:** `bool`
+
 #### `set_escrow_contract`
 Propose the escrow contract used for fleet pause checks. It becomes active
 after three days and a separate `confirm_escrow_contract` call. The pending
@@ -2257,6 +2430,17 @@ Apply the pending escrow contract after its three-day review period.
 **Errors:** `NoPendingContractChange`, `ContractChangeTimelockNotElapsed`
 
 ### Fleet Operations
+
+> **Fleet counter lifetime.** `DataKey::FleetCounter` is a single persistent
+> entry that allocates fleet ids. Every state-changing fleet call (registration,
+> invites, acceptance, removal, treasury/signer changes, (de)activation, payout
+> routing) renews its TTL together with the instance TTL, so the counter stays
+> live during periods with no new registrations. If the whole contract is idle
+> for longer than `LEDGER_TTL_EXTEND_TO` ledgers the counter is archived, not
+> deleted: it must be restored (`RestoreFootprint`, or automatic restoration of
+> archived footprint entries) before the next `register_fleet`, which then
+> continues the existing id sequence and renews the counter. The contract never
+> re-seeds the counter from zero.
 
 #### `register_fleet`
 Register a new fleet, returning its assigned fleet ID.
@@ -2275,7 +2459,7 @@ Register a new fleet, returning its assigned fleet ID.
 **Events:** `fleet_registered`
 
 **State Changes:**
-- Increments and persists the fleet counter
+- Increments and persists the fleet counter, renewing its TTL
 - Creates and stores a `FleetProfile`
 - Calls `identity_reputation_contract.register_driver` for the owner when an identity contract is configured
 
@@ -2348,7 +2532,7 @@ Propose an emergency reassignment for a compromised fleet-owner key. The reassig
 - Stores the pending new owner without changing the fleet profile.
 - Re-proposing replaces the pending target.
 
-**Events:** `fleet_owner_reassignment_proposed`
+**Events:** `fleet_owner_reassign_proposed`
 
 #### `accept_fleet_owner_reassignment`
 Accept a pending admin-proposed owner reassignment. Only the exact proposed address may accept, and it must authorize the call.
@@ -2436,13 +2620,19 @@ Invite a driver to join a fleet.
 - `FleetNotFound` - No fleet with that ID exists
 - `FleetInactive` - The fleet has been deactivated
 - `Unauthorized` - Caller is not an authorized signer
-- `DriverAlreadyInvited` - A pending invite already exists for this driver
+- `DriverAlreadyInvited` - An unexpired pending invite already exists for this driver
 - `DriverAlreadyActive` - Driver is already an active member
+- `DriverNotRegistered` - The driver has no `DriverProfile` in the configured identity contract
+- `IdentityNotConfigured` - No identity contract is configured and no-identity mode is not enabled
 
 **Events:** `driver_invited`
 
 **State Changes:**
 - Stores `DriverFleetStatus::Pending` for `(fleet_id, driver)`
+- Stores `InviteExpiry(fleet_id, driver) = now + INVITE_ACCEPTANCE_WINDOW_SECONDS`
+- Extends both records to `LEDGER_TTL_EXTEND_TO` ledgers, which (by a compile-time assertion) outlives the acceptance window, so an invite cannot be archived while it is still acceptable
+
+**Notes:** A driver whose invite has expired (or was removed/cancelled) can be re-invited; re-inviting opens a fresh window.
 
 #### `cancel_invite`
 Cancel a driver's pending invite before it has been accepted.
@@ -2473,20 +2663,24 @@ Accept a pending fleet invite.
 **Errors:**
 - `FleetNotFound` - No fleet with that ID exists
 - `FleetInactive` - The fleet has been deactivated since the invite was issued
-- `InviteNotFound` - No pending invite exists for this driver
+- `InviteNotFound` - The driver was never invited, or the invite was cancelled/removed
+- `InviteExpired` - The driver was invited, but `INVITE_ACCEPTANCE_WINDOW_SECONDS` elapsed before acceptance; the fleet must re-invite
 - `DriverAlreadyActive` - Driver is already an active member
 - `RosterFull` - The fleet already holds `MAX_ROSTER_SIZE` active drivers
 - `DriverNotRegistered` - The accepting address has no `DriverProfile` in the
   configured identity/reputation contract, so it could never legally complete a
-  delivery (Issue #451). **The check is skipped entirely when no identity
-  contract is configured.**
+  delivery (Issue #451).
+- `IdentityNotConfigured` - No identity contract is configured (or a proposed
+  one is still inside its timelock) and no-identity mode has not been enabled
+  with `set_identity_optional`. The check fails closed so a missing peer
+  cannot admit unregistered drivers.
 
 **Events:** `invite_accepted`
 
 **State Changes:**
 - Sets `DriverFleetStatus::Active` for `(fleet_id, driver)`
 - Increments `FleetProfile.total_active_drivers`
-- Appends the driver as an indexed roster entry
+- Appends the driver as an indexed roster entry, giving the roster slot and the membership record the same TTL
 
 #### `remove_driver_from_fleet`
 Remove a driver from a fleet. Either a signer on the fleet or the driver themselves may initiate the removal.
@@ -2508,16 +2702,25 @@ Remove a driver from a fleet. Either a signer on the fleet or the driver themsel
 **State Changes:**
 - Sets the driver's membership status to `Removed`
 - Decrements `FleetProfile.total_active_drivers` if the driver was active
-- Compacts the roster index so it remains contiguous
+- Compacts the roster index so it remains contiguous; the driver moved into the vacated slot has its membership record renewed together with the slot
 
 #### `get_driver_fleet_status`
-Return the fleet membership status of a driver, or `None` if no record exists.
+Return the fleet membership status of a driver, or `None` if the driver was never invited.
 
 **Parameters:**
 - `fleet_id: FleetId` - Fleet identifier
 - `driver: Address` - Driver address
 
-**Returns:** `Option<DriverFleetStatus>`
+**Returns:** `Option<DriverFleetStatus>` — `Some(Expired)` for a pending invite whose acceptance window has elapsed
+
+#### `get_invite_expiry`
+Return the ledger timestamp after which a pending invite can no longer be accepted.
+
+**Parameters:**
+- `fleet_id: FleetId` - Fleet identifier
+- `driver: Address` - Driver address
+
+**Returns:** `Option<u64>` — `None` when the driver has no pending invite (never invited, active, removed, or a legacy invite issued before acceptance windows, which never expires). Still returned after the window has elapsed.
 
 #### `get_fleet_roster`
 Return a page of the active roster of drivers for a fleet.
@@ -2530,6 +2733,31 @@ Return a page of the active roster of drivers for a fleet.
 **Returns:** `Vec<Address>` — the requested page, clamped to the fleet's actual active driver count
 
 **Notes:** The roster is stored as individually keyed entries, so unbounded enumeration would exceed Soroban's ledger read-entry limits for large fleets (Issue #442). Iterate `offset` in `limit`-sized steps to page through the full roster.
+
+**Errors:**
+- `InternalStorageError` - A roster slot inside the active range is missing (slot and membership out of sync). Previously the slot was silently skipped, returning an incomplete page.
+
+#### `renew_fleet_roster`
+Renew the storage TTL of one page of a fleet's active roster without changing any state.
+
+**Parameters:**
+- `fleet_id: FleetId` - Fleet identifier
+- `offset: u32` - Roster index to start renewing from
+- `limit: u32` - Maximum entries to renew, clamped to `MAX_ROSTER_PAGE_SIZE` (100)
+
+**Authorization:** None (permissionless, like Soroban TTL extension)
+
+**Returns:** `u32` — number of roster entries renewed
+
+**Errors:**
+- `FleetNotFound` - No fleet with that ID exists
+- `InternalStorageError` - A roster slot inside the active range is missing
+
+**State Changes:**
+- Extends each `FleetRoster(fleet_id, index)` slot **and** the matching `DriverFleet(fleet_id, driver)` membership record to the same TTL
+- Extends the fleet profile, fleet counter and instance TTL
+
+**Notes:** Roster slots and membership records are separate ledger entries. Every code path that renews one for an active member renews the other, so they cannot expire independently; this function lets keepers renew a quiet roster page by page.
 
 #### `configure_signers`
 Configure the signer set and signature threshold for a fleet.
@@ -2689,7 +2917,7 @@ active address changes only after three days and a separate
 **Errors:**
 - `Unauthorized` - Caller is not the stored admin
 
-**Events:** `delivery_contract_change_proposed`; confirmation emits
+**Events:** `delivery_contract_proposed`; confirmation emits
 `delivery_contract_updated` - `(admin, delivery_contract)`
 
 #### `confirm_delivery_contract`
@@ -2744,6 +2972,15 @@ Grant or revoke cross-contract call authorization.
 
 **Events:** `authorized_contract_updated` - `(admin, contract_addr, authorized)`
 
+**Grant lifetime:** A grant is a persistent `AuthorizedContract(contract_addr)`
+entry. It is extended to `LEDGER_TTL_EXTEND_TO` when granted (here or in
+`init`) **and again on every authorized use**: each successful
+`increase_reputation`, `decrease_reputation`, `award_reputation`, or
+contract-initiated `suspend_driver` renews the caller's grant and the instance
+TTL. An active delivery/dispute peer therefore cannot lose permission to
+storage archival; only a grant that goes unused for the full TTL ages out.
+Revoking removes the entry, and renewal never re-creates it.
+
 #### `is_authorized_contract`
 Check whether a contract address is authorized to make cross-contract calls.
 
@@ -2751,6 +2988,9 @@ Check whether a contract address is authorized to make cross-contract calls.
 - `contract_addr: Address` - Contract address to check
 
 **Returns:** `bool`
+
+**Notes:** Read-only — it does not renew the grant (Issue #392). See the grant
+lifetime note on `set_authorized_contract`.
 
 #### `update_driver_kyc_status`
 Update a driver's KYC verification status.
@@ -2868,6 +3108,7 @@ pre-checks to avoid an `AlreadyInitialized` panic.
 
 **State Changes:**
 - Creates `DriverProfile` with `reputation_score = 50`, `deliveries_completed = 0`, `kyc_verified = false`
+- For an existing profile, extends its TTL (no other change), so a returning driver's profile is kept live
 
 **Example:**
 ```rust
@@ -2924,6 +3165,44 @@ Check whether a driver profile already exists.
 - `driver: Address` - Driver address
 
 **Returns:** `bool`
+
+Read-only: does not extend TTL (Issue #392). See
+[Driver profile archival recovery](#driver-profile-archival-recovery).
+
+#### `extend_driver_profile_ttl`
+Extend the TTL of an existing driver profile without changing it.
+
+**Parameters:**
+- `driver: Address` - Driver address
+
+**Authorization:** None (permissionless — anyone may pay to keep a profile live)
+
+**Returns:** `DriverProfile`
+
+**Errors:**
+- `ProviderNotFound` - The driver never registered
+
+#### Driver profile archival recovery
+
+`DriverProfile` is persistent storage. Mutations (`register_driver`,
+`update_driver_kyc_status`, reputation changes, `suspend_driver`,
+`reinstate_driver`) extend its TTL to `LEDGER_TTL_EXTEND_TO`; read paths
+(`get_driver_profile`, `has_driver_profile`, `is_driver_suspended`,
+`get_driver_tier`) do not. A driver inactive for longer than that window has
+their profile **archived**, not deleted: history, KYC, and suspension status
+are kept.
+
+To recover, submit any transaction that touches the profile — simulation
+attaches the restore for archived entries. The intended paths are:
+
+- the driver calls `register_driver` again: the existing profile is returned
+  unchanged (no reset, suspension kept) and its TTL is extended;
+- anyone (keeper, fleet operator, admin) calls `extend_driver_profile_ttl`,
+  which needs no signature from the driver.
+
+Off-chain clients must not treat a failed or restore-requiring read as "not
+registered". Operators who want to avoid archival entirely should call
+`extend_driver_profile_ttl` periodically for drivers they want to keep live.
 
 ### Reputation Management
 
@@ -3067,7 +3346,8 @@ Check whether a driver's reputation score meets the enterprise threshold (≥ 75
 Handles cross-border currency swaps during escrow release, allowing drivers to
 receive payment in their preferred asset via an admin-configured swap router.
 The configured router must implement `swap_exact_tokens_for_tokens` with
-`(caller, from_token, to_token, recipient, amount, min_amount_out)` arguments
+`(caller, from_token, to_token, recipient, amount, min_amount_out, deadline)`
+arguments
 and return the actual `amount_out`. It must consume the approved source amount
 and deliver output directly to `recipient`. The escrow funds the settlement
 contract immediately before invoking the swap. Swaps must execute before the
@@ -3108,6 +3388,25 @@ Return the driver's preferred asset for payment, if one has been set.
 
 **Returns:** `Option<Address>`
 
+#### `set_driver_preference`
+Record the asset a driver wants to be paid in, overwriting any previous value.
+
+**Parameters:**
+- `driver: Address` - Driver address (must sign)
+- `to_token: Address` - Payout token contract
+
+`to_token` is probed for the token interface (`decimals()` and `balance()`)
+before it is stored. Account addresses, missing contracts, and contracts that
+do not implement the token interface are rejected, and an existing preference
+is left unchanged.
+
+**Authorization:** Driver (must sign)
+
+**Errors:**
+- `InvalidPreferenceToken` - `to_token` is not a deployed token contract.
+
+**Events:** `driver_preference_updated`
+
 ### Settlement Operations
 
 #### `execute_settlement_swap`
@@ -3118,7 +3417,14 @@ Intended to integrate with the Stellar DEX or a liquidity pool to convert
 `min_amount_out`.
 
 **Parameters:**
-- `caller: Address` - Authorized caller (must sign)
+- `caller: Address` - Authorized caller (must sign); must be the configured
+  escrow contract
+- `delivery_id: u64` - Escrow delivery ID this swap pays out. Because only the
+  authenticated escrow contract may call this function, the identifier is
+  attributable to the escrow that holds the record and can be used to
+  correlate the swap with that escrow record off-chain.
+- `driver: Address` - Driver being paid. `to_token` must equal the preference
+  this driver recorded via `set_driver_preference`.
 - `from_token: Address` - Source token contract address
 - `to_token: Address` - Target token contract address
 - `recipient: Address` - Address receiving the swapped funds
@@ -3129,15 +3435,70 @@ Intended to integrate with the Stellar DEX or a liquidity pool to convert
 
 **Authorization:** Caller (must sign)
 
+**Allowance lifecycle:** the router is approved for exactly `amount` of
+`from_token`, expiring at the next ledger, and that allowance is reset to zero
+as soon as the router returns. After a successful swap the router holds no
+residual allowance over settlement funds; on any failure the approval reverts
+with the rest of the transaction.
+
 **Errors:**
 - `SwapRouterNotConfigured` - No router has been configured.
 - `InvalidSwapParameters` - Amount, token pair, or minimum output is invalid.
 - `InsufficientSwapBalance` - Settlement does not hold the requested input.
-- `SwapOutputBelowMinimum` - Router output is below `min_amount_out`.
+- `SwapOutputBelowMinimum` - The recipient's measured `to_token` balance
+  increase, or the router-reported output, is below `min_amount_out`.
 - `SwapInputNotConsumed` - Router did not consume the exact approved input.
 - `InvalidSwapDeadline` - Deadline is expired or exceeds the 300-second window.
+- `PreferenceMismatch` - `to_token` is not the driver's recorded preference.
+- `InvalidSwapRecipient` - Recipient is the settlement contract, the router,
+  or the escrow caller.
+- `SwapAlreadySettled` - This `(escrow, delivery_id)` already settled.
 
-**Returns:** `()`
+**Binding and trust boundary:** Settlement independently enforces that the
+output asset is the one the driver chose (driver-signed preference), that the
+recipient is not a protocol contract, and that each `(escrow, delivery_id)`
+settles at most once (a `SwapReceipt` is stored). *Which* address receives a
+driver's payout — the driver, a fleet treasury, or a payout address
+snapshotted at escrow creation — is escrow state that settlement cannot read
+mid-call (Soroban forbids re-entering the escrow), so `recipient` is trusted
+to the configured escrow. That trust only follows a *confirmed* escrow
+rotation: a proposed escrow is rejected until
+`PEER_CONTRACT_CHANGE_TIMELOCK_SECONDS` elapses and `confirm_escrow_contract`
+runs, after which the previous escrow is rejected.
+
+**Events:** `settlement_swap_executed` — `SettlementSwapExecutedEvent`
+```rust
+pub struct SettlementSwapExecutedEvent {
+    pub escrow_contract: Address, // authenticated caller
+    pub delivery_id: u64,         // escrow record this swap pays
+    pub driver: Address,          // driver whose preference selected to_token
+    pub from_token: Address,
+    pub to_token: Address,
+    pub recipient: Address,
+    pub amount_in: i128,          // exact input consumed by the router
+    pub amount_out: i128,         // recipient's measured to_token balance delta
+}
+```
+Emitted only when the swap succeeds; a rejected swap emits nothing. Use
+`(escrow_contract, delivery_id)` to join the payout to the escrow's
+`escrow_released` / `dispute_resolved_split` event without relying on
+router-specific events.
+
+**Returns:** `i128` — the measured `amount_out`.
+
+#### `get_swap_receipt`
+Return the receipt of a completed swap for an escrow record.
+
+**Parameters:**
+- `escrow: Address` - Escrow contract that requested the swap
+- `delivery_id: u64` - That escrow's delivery ID
+
+**Returns:** `Option<SwapReceipt>` — `{ driver, recipient, from_token,
+to_token, amount_in, amount_out, settled_at }`
+
+**TypeScript SDK:** `SettlementClient.executeSettlementSwap({ caller, fromToken,
+toToken, recipient, amount, minAmountOut, deadline })` serializes `deadline`
+(a `bigint` of Unix seconds) as `u64` in the final position.
 
 #### `get_driver_fleet_status`
 Get driver's status in a fleet.

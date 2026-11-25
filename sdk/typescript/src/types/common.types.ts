@@ -39,6 +39,11 @@ export enum DriverFleetStatus {
   Pending = 'Pending',
   Active = 'Active',
   Removed = 'Removed',
+  /**
+   * Invited, but the acceptance window elapsed before the driver accepted.
+   * Distinct from `null` (never invited). The fleet may re-invite the driver.
+   */
+  Expired = 'Expired',
 }
 
 /** Mirrors the contract's `DriverStatus` enum in `shared_types`. */
@@ -152,6 +157,8 @@ export const ErrorCodes = {
   ProtocolPaused: 11,
   LimitExceeded: 12,
   TimelockNotElapsed: 13,
+  NoPendingContractChange: 14,
+  ContractChangeTimelockNotElapsed: 15,
 } as const;
 
 export interface ContractInvokeOptions {

@@ -16,7 +16,18 @@ export const EscrowErrorCodes = {
   InvalidDriver: 10,
   InvalidParties: 11,
   BatchTooLarge: 12,
+  InvalidSlippageTolerance: 13,
 } as const;
+
+/**
+ * Role discriminant for `get_escrows_page`, matching
+ * `contracts/escrow_contract/lib.rs::get_escrows_page(owner, kind, offset, limit)`.
+ */
+export enum EscrowPartyKind {
+  Sender = 0,
+  Recipient = 1,
+  Driver = 2,
+}
 
 export interface InitParams {
   admin: string;
@@ -37,12 +48,6 @@ export interface VolumeTier {
 export interface SetVolumeTiersParams {
   admin: string;
   tiers: VolumeTier[];
-}
-
-export interface SweepUntrackedBalanceParams {
-  admin: string;
-  token: string;
-  recipient: string;
 }
 
 export interface CreateEscrowParams {
@@ -114,8 +119,22 @@ export interface MarkHoldbackEscrowParams {
   deliveryId: bigint;
 }
 
+/**
+ * Parameters for `freeze_funds`. `caller` must be the configured dispute
+ * resolution contract; any other address is rejected with `Unauthorized`.
+ */
 export interface FreezeFundsParams {
   caller: string;
+  deliveryId: bigint;
+}
+
+/**
+ * Parameters for `admin_freeze_funds`, the incident-response freeze.
+ */
+export interface AdminFreezeFundsParams {
+  /** Escrow admin; must sign and match the stored admin. */
+  admin: string;
+  /** Delivery whose escrow is frozen. */
   deliveryId: bigint;
 }
 
@@ -157,6 +176,50 @@ export interface ConfirmSettlementContractParams {
   admin: string;
 }
 
+/**
+ * Parameters for `set_delivery_contract`: proposes a timelocked rotation of
+ * the delivery peer contract. Admin only.
+ */
+export interface ProposeDeliveryContractParams {
+  /** Current escrow admin authorising the proposal. */
+  admin: string;
+  /** Proposed delivery contract address. */
+  deliveryContract: string;
+}
+
+/**
+ * Mirrors the Rust `PendingPeerContractChange` struct returned by
+ * `get_pending_delivery_contract`. `null` means no rotation is pending.
+ */
+export interface PendingDeliveryContractInfo {
+  /** The proposed delivery contract address. */
+  deliveryContract: string;
+  /** Admin that proposed the change. */
+  proposedBy: string;
+  /** Unix timestamp (seconds) after which the change may be confirmed. */
+  activatesAt: bigint;
+}
+
+/** Parameters for `propose_admin` (step 1 of the two-party admin handover). */
+export interface ProposeEscrowAdminParams {
+  /** Current admin; must sign and match the stored admin. */
+  currentAdmin: string;
+  /** Address nominated to become admin once it calls `acceptAdmin`. */
+  newAdmin: string;
+}
+
+/** Parameters for `cancel_admin_proposal`. */
+export interface CancelEscrowAdminProposalParams {
+  /** Current admin; must sign and match the stored admin. */
+  currentAdmin: string;
+}
+
+/** Parameters for `accept_admin` (step 2 of the two-party admin handover). */
+export interface AcceptEscrowAdminParams {
+  /** Nominated admin; must sign and match the pending proposal. */
+  newAdmin: string;
+}
+
 export interface SetFleetManagementContractParams {
   admin: string;
   fleetContract: string;
@@ -196,4 +259,34 @@ export interface DeliveryDisputedEvent {
 export interface DisputeResolvedEvent {
   deliveryId: bigint;
   resolver: string;
+}
+
+/** Holdback window applied when the admin has never set one (3 days). Mirrors `DEFAULT_HOLDBACK_WINDOW_SECONDS`. */
+export const DEFAULT_HOLDBACK_WINDOW_SECONDS = 259_200n;
+/** Smallest accepted holdback window (1 day). Mirrors `MIN_HOLDBACK_WINDOW_SECONDS`. */
+export const MIN_HOLDBACK_WINDOW_SECONDS = 86_400n;
+/** Largest accepted holdback window (365 days). Mirrors `MAX_HOLDBACK_WINDOW_SECONDS`. */
+export const MAX_HOLDBACK_WINDOW_SECONDS = 31_536_000n;
+
+export interface SetHoldbackWindowParams {
+  /** Must be the stored escrow admin; the call requires its auth. */
+  admin: string;
+  /** New window in seconds, inclusive range [MIN_HOLDBACK_WINDOW_SECONDS, MAX_HOLDBACK_WINDOW_SECONDS]. */
+  windowSeconds: bigint | number;
+}
+
+/**
+ * On-chain protocol/data version this SDK release targets. Mirrors
+ * `PROTOCOL_VERSION` in escrow_contract; compare against
+ * `EscrowClient.getProtocolVersion()` to detect an incompatible deployment.
+ */
+export const SUPPORTED_PROTOCOL_VERSION = 1;
+/** Largest accepted slippage tolerance (10%). Mirrors `MAX_SLIPPAGE_TOLERANCE_BPS`. */
+export const MAX_SLIPPAGE_TOLERANCE_BPS = 1000;
+
+export interface UpdateSlippageToleranceParams {
+  /** Must be the stored escrow admin; the call requires its auth. */
+  admin: string;
+  /** New tolerance in basis points, integer in the inclusive range [0, MAX_SLIPPAGE_TOLERANCE_BPS]. */
+  newSlippageBps: number;
 }

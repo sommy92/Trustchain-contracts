@@ -33,6 +33,8 @@ define no local error enum and raise only the shared `TrustchainError` below.
 | 11 | `ProtocolPaused` | Protocol is paused and fund movements are halted. |
 | 12 | `LimitExceeded` | Requested operation would exceed a fixed capacity/growth limit (e.g. `dispute_resolution_contract::add_evidence_hash` once the calling party has already submitted its per-party maximum of 20 evidence hashes for that dispute — the cap is enforced per submitting party, so at most `3 × 20` hashes accumulate across the three delivery parties). |
 | 13 | `TimelockNotElapsed` | A requested timelocked operation was attempted before its delay elapsed. |
+| 14 | `NoPendingContractChange` | A peer-contract `confirm_*` call was made with no proposal pending. |
+| 15 | `ContractChangeTimelockNotElapsed` | A peer-contract change was confirmed before its three-day review period elapsed. |
 
 Note: codes `7` and `10` are intentionally unused gaps left by prior variant removals —
 they are not reserved for anything and should not be inferred to mean "no error."
@@ -46,8 +48,13 @@ they are not reserved for anything and should not be inferred to mean "no error.
 | 7 | `InvalidAmount` | Escrow amount is not positive. |
 | 8 | `NoPendingSettlementChange` | `confirm_settlement_contract` called with no proposal pending. |
 | 10 | `InvalidDriver` | Driver address matches the sender or recipient, which is not permitted for escrow creation. |
-| 11 | `InvalidParties` | Sender and recipient are the same address. |
+| 11 | `InvalidParties` | Sender and recipient are the same address, or (with a delivery contract configured) the escrow sender or recipient does not match the delivery record. |
 | 12 | `BatchTooLarge` | `create_escrows_batch` list exceeds `MAX_BATCH_SIZE` (100). |
+| 13 | `InvalidSlippageTolerance` | Requested slippage tolerance exceeds `MAX_SLIPPAGE_TOLERANCE_BPS`. |
+| 14 | `NoPendingContractChange` | `confirm_delivery_contract` called with no proposal pending. |
+| 15 | `ContractChangeTimelockNotElapsed` | Peer-contract change confirmed before its review period ended. |
+| 16 | `InvalidState` | Holdback window outside its permitted range. |
+| 17 | `DeliveryContractNotConfigured` | Escrow creation attempted with no active delivery contract while standalone mode is off. |
 
 Shared failures such as `InvalidState`, `DeliveryNotFound`, `InsufficientFunds`,
 `DuplicateDelivery`, `TimelockNotElapsed`, `Unauthorized`, `NotInitialized`, and
@@ -62,6 +69,9 @@ Shared failures such as `InvalidState`, `DeliveryNotFound`, `InsufficientFunds`,
 | 4 | `InvalidDriver` | Driver address matches the delivery's sender or recipient. |
 | 5 | `InvalidParties` | Sender and recipient are the same address. |
 | 6 | `EscrowNotLocked` | The escrow is absent or not locked when funded escrow is required. |
+| 7 | `InvalidIndexKind` | `get_deliveries_page` was called with an unknown index kind. |
+| 8 | `EscrowPartyMismatch` | `confirm_delivery` found the escrow bound to a different driver, sender, or recipient than the delivery. |
+| 9 | `IdentityNotConfigured` | `assign_driver` ran with no identity contract configured and no-identity mode not enabled (or `require_kyc` set). |
 
 Shared failures such as `InvalidState`, `Unauthorized`, `DeliveryNotFound`, and
 `NotInitialized` use `TrustchainError`.
@@ -77,9 +87,13 @@ Shared failures such as `InvalidState`, `Unauthorized`, `DeliveryNotFound`, and
 | 8 | `NoPendingTreasuryChange` | `confirm_fleet_treasury_update` called with no proposal pending. |
 | 10 | `FleetInactive` | Requested operation is invalid because the fleet has been deactivated. |
 | 11 | `InvalidConfiguration` | Signer configuration contains an invalid threshold, or a fleet was reactivated while already active. |
-| 12 | `InternalStorageError` | Roster compaction read a storage slot that should have existed but was absent. |
+| 12 | `InternalStorageError` | A roster read (`get_fleet_roster`, `renew_fleet_roster`) or roster compaction found a slot that should have existed but was absent. |
 | 13 | `DriverNotRegistered` | `accept_fleet_invite` was called by an address with no `DriverProfile` in the configured identity/reputation contract (Issue #451). |
 | 14 | `RosterFull` | The fleet already holds `MAX_ROSTER_SIZE` active drivers. |
+| 15 | `NoPendingContractChange` | `confirm_identity_contract` / `confirm_escrow_contract` called with no proposal pending. |
+| 16 | `ContractChangeTimelockNotElapsed` | A peer-contract change was confirmed before its review period elapsed. |
+| 17 | `NoPendingOwnerReassignment` | `accept_fleet_owner_reassignment` called with no reassignment pending. |
+| 18 | `IdentityNotConfigured` | `add_driver_to_fleet` / `accept_fleet_invite` ran with no identity contract configured and no-identity mode not enabled. |
 
 Shared failures such as `AlreadyInitialized`, `NotInitialized`, `Unauthorized`, and
 `TimelockNotElapsed` use `TrustchainError`.
@@ -95,6 +109,7 @@ Shared failures such as `AlreadyInitialized`, `NotInitialized`, `Unauthorized`, 
 | 5 | `InsufficientSwapBalance` | Settlement does not hold the requested input amount. |
 | 6 | `SwapInputNotConsumed` | Router did not consume the exact approved input amount. |
 | 7 | `InvalidSwapDeadline` | Swap deadline is expired or exceeds the 300-second window. |
+| 8 | `InvalidPreferenceToken` | `set_driver_preference` target is not a deployed token contract. |
 
 ## Contracts with no local error enum
 

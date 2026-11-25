@@ -78,9 +78,73 @@ pub enum DataKey {
     /// permitted.  Defaults to `false` so existing deployments and test
     /// fixtures continue to work unchanged (Issue #314).
     RequireKyc,
+    /// When `true`, the deployment has deliberately opted out of identity
+    /// integration and `assign_driver` may run with no
+    /// `IdentityReputationContract` configured. Defaults to `false`: without
+    /// an identity contract, assignment fails closed.
+    IdentityOptional,
+}
+
+/// Read the delivery ID counter.
+///
+/// The counter is stored in instance storage so that it lives exactly as long
+/// as the contract instance and is renewed by every instance TTL extension.
+/// Deployments that predate this layout kept the counter in persistent
+/// storage; that legacy value is still honoured (and migrated on the next
+/// write) so already-issued IDs are never reused.
+///
+/// An absent counter after initialization is treated as a hard error rather
+/// than silently restarting from zero, because restarting would hand out IDs
+/// that collide with existing delivery records.
+fn read_delivery_counter(env: &Env) -> u64 {
+    if let Some(counter) = env.storage().instance().get(&DataKey::DeliveryCounter) {
+        return counter;
+    }
+    env.storage()
+        .persistent()
+        .get(&DataKey::DeliveryCounter)
+        .unwrap_or_else(|| panic_with_error!(env, TrustchainError::NotInitialized))
+}
+
+/// Persist the delivery ID counter in instance storage, dropping any legacy
+/// persistent copy so only one authoritative value exists.
+fn write_delivery_counter(env: &Env, counter: u64) {
+    env.storage()
+        .instance()
+        .set(&DataKey::DeliveryCounter, &counter);
+    env.storage()
+        .instance()
+        .extend_ttl(ttl::LEDGER_TTL_THRESHOLD, ttl::LEDGER_TTL_EXTEND_TO);
+    if env.storage().persistent().has(&DataKey::DeliveryCounter) {
+        env.storage().persistent().remove(&DataKey::DeliveryCounter);
+    }
+}
+
+fn next_delivery_counter(env: &Env, counter: u64) -> u64 {
+    counter
+        .checked_add(1)
+        .unwrap_or_else(|| panic_with_error!(env, TrustchainError::InvalidState))
 }
 
 const INDEX_PAGE: u32 = 64;
+
+/// Extend a persistent owner-index entry to the protocol-wide TTL horizon.
+fn extend_index_ttl(env: &Env, key: &DataKey) {
+    env.storage()
+        .persistent()
+        .extend_ttl(key, ttl::LEDGER_TTL_THRESHOLD, ttl::LEDGER_TTL_EXTEND_TO);
+}
+
+/// Append `id` to `owner`'s index of the given `kind`.
+///
+/// Invariant: the page and the `DeliveryIndexLen` counter are written together
+/// and always extended together, to the same horizon as the delivery records
+/// they enumerate. A lapsed page under a live length would silently drop IDs
+/// from enumeration; a lapsed length over live pages would make the next push
+/// restart at page 0 and overwrite history. Older, already-full pages are
+/// renewed by `index_page` whenever they are read; renewal on push is kept to
+/// the two entries written so the footprint stays constant however long an
+/// owner's history grows.
 #[rustfmt::skip]
 fn index_push(env: &Env, owner: &Address, kind: u32, id: DeliveryId) {
     let len_key = DataKey::DeliveryIndexLen(owner.clone(), kind);
@@ -91,21 +155,52 @@ fn index_push(env: &Env, owner: &Address, kind: u32, id: DeliveryId) {
     page.push_back(id);
     env.storage().persistent().set(&key, &page);
     env.storage().persistent().set(&len_key, &(len + 1));
+    extend_index_ttl(env, &key);
+    extend_index_ttl(env, &len_key);
 }
 
+/// Read up to `limit` (capped at 100) IDs from `owner`'s index starting at
+/// `offset`. Reading renews the length and every page touched, so listings
+/// that are being consumed stay alive alongside the records they point to.
 #[rustfmt::skip]
 fn index_page(env: &Env, owner: Address, kind: u32, offset: u32, limit: u32) -> soroban_sdk::Vec<DeliveryId> {
-    let len: u32 = env.storage().persistent()
-        .get(&DataKey::DeliveryIndexLen(owner.clone(), kind)).unwrap_or(0);
+    let len_key = DataKey::DeliveryIndexLen(owner.clone(), kind);
+    let len: u32 = env.storage().persistent().get(&len_key).unwrap_or(0);
     let mut out = soroban_sdk::Vec::new(env);
+    if len == 0 {
+        return out;
+    }
+    extend_index_ttl(env, &len_key);
     let end = len.min(offset.saturating_add(limit.min(100)));
+    let mut loaded: Option<(u32, soroban_sdk::Vec<DeliveryId>)> = None;
     for i in offset.min(len)..end {
-        let page: soroban_sdk::Vec<DeliveryId> = env.storage().persistent()
-            .get(&DataKey::DeliveryIndex(owner.clone(), kind, i / INDEX_PAGE))
-            .unwrap_or_else(|| soroban_sdk::Vec::new(env));
-        if let Some(id) = page.get(i % INDEX_PAGE) { out.push_back(id); }
+        let page_no = i / INDEX_PAGE;
+        if loaded.as_ref().map(|(n, _)| *n) != Some(page_no) {
+            let key = DataKey::DeliveryIndex(owner.clone(), kind, page_no);
+            let page: soroban_sdk::Vec<DeliveryId> = env.storage().persistent().get(&key)
+                .unwrap_or_else(|| soroban_sdk::Vec::new(env));
+            if !page.is_empty() { extend_index_ttl(env, &key); }
+            loaded = Some((page_no, page));
+        }
+        if let Some((_, page)) = loaded.as_ref() {
+            if let Some(id) = page.get(i % INDEX_PAGE) { out.push_back(id); }
+        }
     }
     out
+}
+
+/// `true` when the escrow is bound to exactly the delivery's sender,
+/// recipient, and assigned driver. A delivery with no driver never matches:
+/// there is no one the escrow could legitimately pay.
+fn escrow_parties_match(delivery: &DeliveryRecord, escrow: &shared_types::EscrowRecord) -> bool {
+    match &delivery.driver {
+        Some(driver) => {
+            *driver == escrow.driver
+                && delivery.sender == escrow.sender
+                && delivery.recipient == escrow.recipient
+        }
+        None => false,
+    }
 }
 
 #[contracterror]
@@ -126,6 +221,14 @@ pub enum DeliveryError {
     /// (currently: the `Active -> InTransit` transition). See Issue #298.
     EscrowNotLocked = 6,
     InvalidIndexKind = 7,
+    /// The escrow securing this delivery is bound to a different driver,
+    /// sender, or recipient than the delivery record, so confirming would
+    /// mark the delivery complete while paying someone else.
+    EscrowPartyMismatch = 8,
+    /// `assign_driver` was called with no identity_reputation_contract
+    /// configured and the deployment has not opted into no-identity mode
+    /// via `set_identity_optional`, so the driver cannot be verified.
+    IdentityNotConfigured = 9,
 }
 
 mod constants {
@@ -140,12 +243,17 @@ mod constants {
 ///   Active    → InTransit, Disputed, Cancelled
 ///   InTransit → Delivered, Disputed, Cancelled  (Issue #300: Cancelled added so
 ///               reclaim_delivery_expired_escrow can synchronise an in-transit
-///               delivery whose escrow expired)
+///               delivery whose escrow expired. This is the *only* route to
+///               Cancelled from InTransit: `cancel_delivery` rejects it with
+///               `DeliveryError::TransitAlreadyStarted`.)
 ///   Delivered → Disputed
+///   Delivered → Cancelled  (Issue #110: admin holdback-refund recovery path that
+///               synchronises a Delivered delivery whose Holdback escrow was
+///               refunded back to the sender)
 ///   Disputed  → Delivered (only via dispute resolution)
 ///   Disputed  → Resolved (only via dispute resolution, Issue #447)
 ///   Cancelled → (terminal, no transitions)
-///   Delivered → (terminal, no further transitions)
+///   Delivered → (terminal except for Disputed and the Issue #110 admin path above)
 ///   Resolved  → (terminal, no further transitions)
 pub fn validate_transition(from: DeliveryStatus, to: DeliveryStatus) -> Result<(), TrustchainError> {
     let valid = matches!(
@@ -159,6 +267,7 @@ pub fn validate_transition(from: DeliveryStatus, to: DeliveryStatus) -> Result<(
             | (DeliveryStatus::InTransit, DeliveryStatus::Disputed)
             | (DeliveryStatus::InTransit, DeliveryStatus::Cancelled)
             | (DeliveryStatus::Delivered, DeliveryStatus::Disputed)
+            | (DeliveryStatus::Delivered, DeliveryStatus::Cancelled)
             | (DeliveryStatus::Disputed, DeliveryStatus::Delivered)
             | (DeliveryStatus::Disputed, DeliveryStatus::Resolved)
     );
@@ -170,7 +279,7 @@ pub fn validate_transition(from: DeliveryStatus, to: DeliveryStatus) -> Result<(
 }
 
 fn validate_delivery_metadata(
-    _env: &Env,
+    env: &Env,
     metadata: &DeliveryMetadata,
 ) -> Result<(), DeliveryError> {
     if metadata.origin.len() < constants::MIN_LOCATION_LEN
@@ -189,7 +298,40 @@ fn validate_delivery_metadata(
     if !metadata.cargo_description.has_valid_weight() {
         return Err(DeliveryError::InvalidMetadata);
     }
+
+    // Issue #130: validate estimated_delivery is in the future relative to ledger time
+    let now = env.ledger().timestamp();
+    if metadata.estimated_delivery <= now {
+        return Err(DeliveryError::InvalidMetadata);
+    }
+
     Ok(())
+}
+
+/// Returns `true` when `escrow` is the escrow funding `delivery`: same
+/// delivery ID, same sender and recipient, and — once a driver is assigned —
+/// the same driver.
+///
+/// Escrows are created by a separate call on a separate contract and are
+/// keyed only by delivery ID, so the record found under that ID is not
+/// guaranteed to belong to this delivery (for example when the escrow was
+/// created before a driver was assigned, or while the escrow contract had no
+/// delivery contract configured to cross-check against).
+fn escrow_matches_delivery(
+    delivery_id: DeliveryId,
+    delivery: &DeliveryRecord,
+    escrow: &shared_types::EscrowRecord,
+) -> bool {
+    if escrow.delivery_id != u64::from(delivery_id)
+        || escrow.sender != delivery.sender
+        || escrow.recipient != delivery.recipient
+    {
+        return false;
+    }
+    match &delivery.driver {
+        Some(driver) => *driver == escrow.driver,
+        None => true,
+    }
 }
 
 #[contract]
@@ -203,18 +345,17 @@ impl DeliveryContract {
             panic_with_error!(&env, TrustchainError::AlreadyInitialized);
         }
         admin.require_auth();
+        // Issue #94: validate admin/escrow_contract before persisting either.
+        shared_types::validate_init_addresses(&env, &[&admin, &escrow_contract]);
         env.storage().instance().set(&StorageKey::Admin, &admin);
         env.storage()
             .instance()
             .set(&DataKey::EscrowContract, &escrow_contract);
-        env.storage()
-            .persistent()
-            .set(&DataKey::DeliveryCounter, &0u64);
-        env.storage().persistent().extend_ttl(
-            &DataKey::DeliveryCounter,
-            ttl::LEDGER_TTL_THRESHOLD,
-            ttl::LEDGER_TTL_EXTEND_TO,
-        );
+        // The delivery ID counter lives in instance storage so it shares the
+        // contract instance's lifetime and can never be archived independently
+        // during quiet periods (which would otherwise reset IDs to zero and
+        // collide with still-live delivery records).
+        write_delivery_counter(&env, 0);
 
         env.events().publish(
             (events::delivery_contract_initialized(&env),),
@@ -325,9 +466,9 @@ impl DeliveryContract {
             .storage()
             .instance()
             .get(&DataKey::PendingEscrowContract)
-            .unwrap_or_else(|| panic_with_error!(&env, DeliveryError::NoPendingContractChange));
+            .unwrap_or_else(|| panic_with_error!(&env, TrustchainError::NoPendingContractChange));
         if env.ledger().timestamp() < pending.activates_at {
-            panic_with_error!(&env, DeliveryError::ContractChangeTimelockNotElapsed);
+            panic_with_error!(&env, TrustchainError::ContractChangeTimelockNotElapsed);
         }
         env.storage()
             .instance()
@@ -367,10 +508,10 @@ impl DeliveryContract {
     /// existing flows are unaffected.  The default allows existing test
     /// fixtures and testnet deployments to keep working without changes.
     ///
-    /// The gate is silently skipped when no identity contract is configured,
-    /// matching the optional-integration pattern used by reputation calls,
-    /// so deployments that have not wired up the identity contract continue
-    /// to work even when this flag is `true`.
+    /// KYC cannot be verified without an identity contract, so when this flag
+    /// is `true` and no identity contract is configured, `assign_driver`
+    /// fails with `DeliveryError::IdentityNotConfigured` — even in
+    /// no-identity mode (see `set_identity_optional`).
     ///
     /// **Authorization:** Admin only.
     #[allow(deprecated)] // events().publish() deprecated in SDK 27; see SOROBAN_SDK_27_MIGRATION.md
@@ -394,6 +535,50 @@ impl DeliveryContract {
             (Symbol::new(&env, "require_kyc_updated"),),
             (admin, required),
         );
+    }
+
+    /// Explicitly opt in to (or out of) running without identity integration
+    /// (no-identity mode).
+    ///
+    /// By default `assign_driver` fails closed with
+    /// `DeliveryError::IdentityNotConfigured` when no
+    /// `identity_reputation_contract` is configured: otherwise a partially
+    /// configured deployment would accept arbitrary, unregistered, or
+    /// suspended driver addresses. Standalone deployments that do not run the
+    /// identity contract must set `optional = true` deliberately.
+    ///
+    /// This flag only matters while no identity contract is configured; once
+    /// one is set, registration, suspension, and KYC checks always apply.
+    /// `require_kyc` can never be satisfied without an identity contract, so
+    /// it still fails closed in no-identity mode.
+    ///
+    /// **Authorization:** Admin only.
+    #[allow(deprecated)] // events().publish() deprecated in SDK 27; see SOROBAN_SDK_27_MIGRATION.md
+    pub fn set_identity_optional(env: Env, admin: Address, optional: bool) {
+        admin.require_auth();
+        if !is_admin(&env, &admin) {
+            panic_with_error!(&env, TrustchainError::Unauthorized);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::IdentityOptional, &optional);
+        env.storage()
+            .instance()
+            .extend_ttl(ttl::LEDGER_TTL_THRESHOLD, ttl::LEDGER_TTL_EXTEND_TO);
+        env.events().publish(
+            (Symbol::new(&env, "identity_optional_updated"),),
+            (admin, optional),
+        );
+    }
+
+    /// `true` when the deployment has opted into no-identity mode via
+    /// `set_identity_optional`; `false` (the default) means `assign_driver`
+    /// requires a configured identity contract.
+    pub fn get_identity_optional(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::IdentityOptional)
+            .unwrap_or(false)
     }
 
     /// Returns the current KYC-enforcement setting.  `true` means
@@ -445,20 +630,8 @@ impl DeliveryContract {
             .instance()
             .extend_ttl(ttl::LEDGER_TTL_THRESHOLD, ttl::LEDGER_TTL_EXTEND_TO);
 
-        let mut counter: u64 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::DeliveryCounter)
-            .unwrap_or(0);
-        counter += 1;
-        env.storage()
-            .persistent()
-            .set(&DataKey::DeliveryCounter, &counter);
-        env.storage().persistent().extend_ttl(
-            &DataKey::DeliveryCounter,
-            ttl::LEDGER_TTL_THRESHOLD,
-            ttl::LEDGER_TTL_EXTEND_TO,
-        );
+        let counter = next_delivery_counter(&env, read_delivery_counter(&env));
+        write_delivery_counter(&env, counter);
 
         let delivery_id = DeliveryId::from(counter);
 
@@ -468,6 +641,8 @@ impl DeliveryContract {
         // DeliveryMetadata struct.
         let mut metadata = metadata;
         metadata.delivery_id = counter;
+        // Issue #130: overwrite created_at with ledger timestamp
+        metadata.created_at = env.ledger().timestamp();
 
         let record = DeliveryRecord {
             delivery_id,
@@ -548,30 +723,27 @@ impl DeliveryContract {
         }
 
         let mut result = soroban_sdk::Vec::new(&env);
-        let mut counter: u64 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::DeliveryCounter)
-            .unwrap_or(0);
+        // Keep the instance (and therefore the delivery counter) alive for
+        // batch creation exactly as `create_delivery` does.
+        env.storage()
+            .instance()
+            .extend_ttl(ttl::LEDGER_TTL_THRESHOLD, ttl::LEDGER_TTL_EXTEND_TO);
+
+        let mut counter: u64 = read_delivery_counter(&env);
 
         let timestamp = env.ledger().timestamp();
 
         for i in 0..metadata_list.len() {
             if let Some(mut metadata) = metadata_list.get(i) {
-                counter += 1;
-                env.storage()
-                    .persistent()
-                    .set(&DataKey::DeliveryCounter, &counter);
-                env.storage().persistent().extend_ttl(
-                    &DataKey::DeliveryCounter,
-                    ttl::LEDGER_TTL_THRESHOLD,
-                    ttl::LEDGER_TTL_EXTEND_TO,
-                );
+                counter = next_delivery_counter(&env, counter);
+                write_delivery_counter(&env, counter);
 
                 let delivery_id = DeliveryId::from(counter);
                 // See create_delivery: overwrite with the real generated ID
                 // rather than trusting the caller-supplied value (Issue #45).
                 metadata.delivery_id = counter;
+                // Issue #130: overwrite created_at with ledger timestamp
+                metadata.created_at = timestamp;
 
                 let record = DeliveryRecord {
                     delivery_id,
@@ -608,6 +780,16 @@ impl DeliveryContract {
             }
         }
 
+        // Extend instance TTL after a successful batch so the protocol's core
+        // configuration pointers (Admin, EscrowContract,
+        // IdentityReputationContract) cannot be archived while the contract is
+        // only ever used through batch creation (Issue #127). This mirrors
+        // `create_delivery` and also runs on the empty-batch path, matching the
+        // single-creation policy.
+        env.storage()
+            .instance()
+            .extend_ttl(ttl::LEDGER_TTL_THRESHOLD, ttl::LEDGER_TTL_EXTEND_TO);
+
         result
     }
 
@@ -632,7 +814,8 @@ impl DeliveryContract {
             panic_with_error!(&env, TrustchainError::Unauthorized);
         }
 
-        if delivery.status != DeliveryStatus::Pending && delivery.status != DeliveryStatus::Active {
+        // Issue #128: restrict metadata edits to Pending only
+        if delivery.status != DeliveryStatus::Pending {
             panic_with_error!(&env, TrustchainError::InvalidState);
         }
 
@@ -658,6 +841,24 @@ impl DeliveryContract {
         );
     }
 
+    /// Cancel a delivery and refund its escrow to the sender.
+    ///
+    /// **Authorization:** the delivery's sender.
+    ///
+    /// **Transit rule:** cancellation is only allowed from `Pending` or
+    /// `Active`. Once the driver has called `mark_in_transit` they hold the
+    /// goods, so letting the sender cancel would refund the full escrow and
+    /// leave the driver's service unpaid. An `InTransit` delivery is rejected
+    /// with `DeliveryError::TransitAlreadyStarted`; its only exits are
+    /// `confirm_delivery`, a dispute via `dispute_resolution_contract`, or
+    /// `reclaim_delivery_expired_escrow` once the escrow has expired.
+    ///
+    /// **Escrow handling:** the escrow under `delivery_id` is refunded only
+    /// when it belongs to this delivery (same delivery ID and sender) and is
+    /// `Locked`. A foreign or already-refunded escrow is left alone and the
+    /// cancellation reports `refund_amount = 0`; an owned escrow that is
+    /// paused, in holdback or settled rejects the cancellation with
+    /// `DeliveryError::EscrowNotLocked`.
     #[allow(deprecated)] // events().publish() is deprecated in SDK 27.0.0 but still functional; tracked in SOROBAN_SDK_27_MIGRATION.md#event-system-migration (Issue #114)
     pub fn cancel_delivery(env: Env, sender: Address, delivery_id: DeliveryId) {
         sender.require_auth();
@@ -672,6 +873,12 @@ impl DeliveryContract {
 
         if delivery.sender != sender {
             panic_with_error!(&env, TrustchainError::Unauthorized);
+        }
+
+        // The driver has taken custody: the sender cannot unilaterally
+        // cancel and claw back the escrow from here.
+        if delivery.status == DeliveryStatus::InTransit {
+            panic_with_error!(&env, DeliveryError::TransitAlreadyStarted);
         }
 
         validate_transition(delivery.status, DeliveryStatus::Cancelled)
@@ -689,6 +896,22 @@ impl DeliveryContract {
         // attempting the refund cross-contract call (Issue #538). If no
         // escrow was attached, skip the refund and transition directly to
         // Cancelled with refund_amount = 0.
+        //
+        // When an escrow exists, its ownership and state are validated
+        // before anything is refunded or reported, so `refund_amount` in the
+        // `delivery_cancelled` event is non-zero only when this call actually
+        // returned funds to the sender:
+        //   - not owned by this delivery (different delivery_id or sender):
+        //     left untouched, cancellation proceeds, refund_amount = 0. A
+        //     foreign escrow must neither block the cancellation nor be
+        //     reported as this sender's refund.
+        //   - owned and Locked: refunded, refund_amount = escrow.amount.
+        //   - owned and already Refunded (e.g. reclaimed directly on the
+        //     escrow contract): nothing left to refund, refund_amount = 0.
+        //   - owned and Paused / Holdback / Released / Split: the funds are
+        //     under dispute or settled, so cancellation is rejected with
+        //     `DeliveryError::EscrowNotLocked`.
+        // The skipped cases also emit `cancel_escrow_skipped` with a reason.
         let mut refund_amount: i128 = 0;
         let has_escrow: bool = env.invoke_contract(
             &escrow_address,
@@ -701,17 +924,39 @@ impl DeliveryContract {
                 &soroban_sdk::Symbol::new(&env, "get_escrow"),
                 soroban_sdk::vec![&env, u64::from(delivery_id).into_val(&env)],
             );
-            refund_amount = escrow.amount;
 
-            let _: () = env.invoke_contract(
-                &escrow_address,
-                &soroban_sdk::Symbol::new(&env, "refund_escrow"),
-                soroban_sdk::vec![
-                    &env,
-                    sender.into_val(&env),
-                    u64::from(delivery_id).into_val(&env),
-                ],
-            );
+            let owned = escrow.delivery_id == u64::from(delivery_id)
+                && escrow.sender == delivery.sender;
+            let skip_reason = if !owned {
+                Some("foreign_escrow")
+            } else {
+                match escrow.status {
+                    shared_types::EscrowStatus::Locked => None,
+                    shared_types::EscrowStatus::Refunded => Some("already_refunded"),
+                    _ => panic_with_error!(&env, DeliveryError::EscrowNotLocked),
+                }
+            };
+
+            match skip_reason {
+                None => {
+                    let _: () = env.invoke_contract(
+                        &escrow_address,
+                        &soroban_sdk::Symbol::new(&env, "refund_escrow"),
+                        soroban_sdk::vec![
+                            &env,
+                            sender.into_val(&env),
+                            u64::from(delivery_id).into_val(&env),
+                        ],
+                    );
+                    refund_amount = escrow.amount;
+                }
+                Some(reason) => {
+                    env.events().publish(
+                        (Symbol::new(&env, "cancel_escrow_skipped"),),
+                        (delivery_id, Symbol::new(&env, reason)),
+                    );
+                }
+            }
         }
 
         delivery.status = DeliveryStatus::Cancelled;
@@ -735,6 +980,12 @@ impl DeliveryContract {
     /// escrow funding. The escrow precondition is enforced one step later, at
     /// `mark_in_transit` — the point where the driver physically takes
     /// custody of the package and the commitment becomes real.
+    ///
+    /// Driver binding: escrow creation may precede assignment, so when an
+    /// escrow is already funded for this delivery the assigned driver must be
+    /// the escrow's driver (`DeliveryError::EscrowDriverMismatch` otherwise).
+    /// This keeps the party doing the delivery and the party being paid for
+    /// it the same, whichever of funding and assignment happens first.
     #[allow(deprecated)] // events().publish() is deprecated in SDK 27.0.0 but still functional; tracked in SOROBAN_SDK_27_MIGRATION.md#event-system-migration (Issue #114)
     pub fn assign_driver(env: Env, caller: Address, delivery_id: DeliveryId, driver: Address) {
         caller.require_auth();
@@ -759,11 +1010,25 @@ impl DeliveryContract {
             panic_with_error!(&env, DeliveryError::InvalidDriver);
         }
 
+        let require_kyc: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::RequireKyc)
+            .unwrap_or(false);
+
         // Issue #449: fetch the driver's profile from identity_reputation_contract
         // before assignment succeeds. An unregistered driver would later cause
         // confirm_delivery to panic inside increase_reputation (ProviderNotFound),
         // permanently locking the delivery in InTransit and bricking the escrow.
-        if let Some(identity_contract) = Self::get_identity_reputation_contract(env.clone()) {
+        //
+        // With no identity contract configured, fail closed unless the admin
+        // has deliberately enabled no-identity mode; a KYC requirement can
+        // never be met without one.
+        let identity = Self::get_identity_reputation_contract(env.clone());
+        if identity.is_none() && (require_kyc || !Self::get_identity_optional(env.clone())) {
+            panic_with_error!(&env, DeliveryError::IdentityNotConfigured);
+        }
+        if let Some(identity_contract) = identity {
             let has_profile: bool = env.invoke_contract(
                 &identity_contract,
                 &Symbol::new(&env, "has_driver_profile"),
@@ -783,11 +1048,6 @@ impl DeliveryContract {
             }
 
             // Issue #314: when `require_kyc` is enabled, verify that `kyc_verified == true`.
-            let require_kyc: bool = env
-                .storage()
-                .instance()
-                .get(&DataKey::RequireKyc)
-                .unwrap_or(false);
             if require_kyc && !profile.kyc_verified {
                 panic_with_error!(&env, TrustchainError::Unauthorized);
             }
@@ -795,6 +1055,23 @@ impl DeliveryContract {
 
         validate_transition(delivery.status, DeliveryStatus::Active)
             .unwrap_or_else(|_| panic_with_error!(&env, TrustchainError::InvalidState));
+
+        // Bind the assignment to an already-funded escrow's payout target.
+        let escrow_address: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::EscrowContract)
+            .unwrap_or_else(|| panic_with_error!(&env, TrustchainError::NotInitialized));
+        let escrow_driver: Option<Address> = env.invoke_contract(
+            &escrow_address,
+            &Symbol::new(&env, "get_escrow_driver"),
+            soroban_sdk::vec![&env, delivery_id.value().into_val(&env)],
+        );
+        if let Some(escrow_driver) = escrow_driver {
+            if escrow_driver != driver {
+                panic_with_error!(&env, DeliveryError::EscrowDriverMismatch);
+            }
+        }
 
         delivery.driver = Some(driver.clone());
         delivery.status = DeliveryStatus::Active;
@@ -834,7 +1111,9 @@ impl DeliveryContract {
     /// package for a delivery that has no escrow at all, or one whose escrow
     /// was already refunded (e.g. by `reclaim_expired_escrow`, which does not
     /// touch the delivery). A missing escrow surfaces as the escrow
-    /// contract's `DeliveryNotFound`; a present-but-not-`Locked` escrow
+    /// contract's `DeliveryNotFound`; an escrow whose delivery ID, sender,
+    /// recipient or driver differs from this delivery yields
+    /// `DeliveryError::EscrowMismatch`; a matching but not-`Locked` escrow
     /// yields the typed `DeliveryError::EscrowNotLocked`. This adds one
     /// cross-contract call to a hot path, which is a deliberate trade-off:
     /// the driver's assurance that funds exist is worth the extra read.
@@ -860,10 +1139,27 @@ impl DeliveryContract {
             let is_suspended: bool = env.invoke_contract(
                 &identity_contract,
                 &Symbol::new(&env, "is_driver_suspended"),
-                soroban_sdk::vec![&env, driver.into_val(&env)],
+                soroban_sdk::vec![&env, driver.clone().into_val(&env)],
             );
             if is_suspended {
                 panic_with_error!(&env, TrustchainError::Unauthorized);
+            }
+
+            // Issue #129: recheck KYC at transit when policy requires it
+            let require_kyc: bool = env
+                .storage()
+                .instance()
+                .get(&DataKey::RequireKyc)
+                .unwrap_or(false);
+            if require_kyc {
+                let profile: DriverProfile = env.invoke_contract(
+                    &identity_contract,
+                    &Symbol::new(&env, "get_driver_profile"),
+                    soroban_sdk::vec![&env, driver.clone().into_val(&env)],
+                );
+                if !profile.kyc_verified {
+                    panic_with_error!(&env, TrustchainError::Unauthorized);
+                }
             }
         }
 
@@ -882,6 +1178,13 @@ impl DeliveryContract {
             &Symbol::new(&env, "get_escrow"),
             soroban_sdk::vec![&env, u64::from(delivery_id).into_val(&env)],
         );
+        // The escrow must fund *this* delivery: same ID, sender, recipient
+        // and assigned driver. A Locked escrow for different parties would
+        // otherwise satisfy the funded precondition while paying, or
+        // refunding, the wrong actor.
+        if !escrow_matches_delivery(delivery_id, &delivery, &escrow) {
+            panic_with_error!(&env, DeliveryError::EscrowMismatch);
+        }
         if escrow.status != shared_types::EscrowStatus::Locked {
             panic_with_error!(&env, DeliveryError::EscrowNotLocked);
         }
@@ -935,6 +1238,22 @@ impl DeliveryContract {
             .unwrap_or_else(|| panic_with_error!(&env, TrustchainError::NotInitialized));
 
         use soroban_sdk::IntoVal;
+
+        // The escrow is created by a separate call on a separate contract and
+        // looked up only by delivery ID, so nothing else guarantees it pays
+        // the driver who actually carried this delivery. Bind the parties
+        // before marking the delivery complete; otherwise a mismatched pair
+        // would record the delivery as done while escrow pays a different
+        // address (and reputation would credit the wrong driver).
+        let escrow: shared_types::EscrowRecord = env.invoke_contract(
+            &escrow_address,
+            &Symbol::new(&env, "get_escrow"),
+            soroban_sdk::vec![&env, u64::from(delivery_id).into_val(&env)],
+        );
+        if !escrow_parties_match(&delivery, &escrow) {
+            panic_with_error!(&env, DeliveryError::EscrowPartyMismatch);
+        }
+
         let _: () = env.invoke_contract(
             &escrow_address,
             &soroban_sdk::Symbol::new(&env, "mark_holdback_escrow"),
@@ -1264,7 +1583,10 @@ impl DeliveryContract {
             (DeliveryStatus::Resolved, shared_types::EscrowStatus::Released) => true,
             (DeliveryStatus::Resolved, shared_types::EscrowStatus::Split) => true,
 
-            // Cancelled: escrow should be Refunded
+            // Cancelled: escrow should be Refunded. This covers both the
+            // normal sender-initiated cancel path and the admin holdback-refund
+            // recovery path (Issue #110) that transitions Delivered → Cancelled
+            // while simultaneously refunding the escrow.
             (DeliveryStatus::Cancelled, shared_types::EscrowStatus::Refunded) => true,
 
             // Any other combination is a mismatch
@@ -1299,6 +1621,127 @@ impl DeliveryContract {
             panic_with_error!(&env, DeliveryError::InvalidIndexKind);
         }
         index_page(&env, owner, kind, offset, limit)
+    }
+
+    /// Admin recovery path that refunds a `Holdback` escrow back to the
+    /// sender and synchronises the delivery and driver reputation atomically
+    /// (Issue #110).
+    ///
+    /// **Why this entry point exists.**
+    /// `confirm_delivery` transitions the delivery to `Delivered`, awards the
+    /// driver a reputation point, and moves the escrow to `Holdback`. An admin
+    /// who then calls `escrow_contract::refund_escrow` directly can refund the
+    /// sender, but that call cannot touch the delivery record or the driver's
+    /// reputation: the escrow contract is not on the identity contract's
+    /// `AuthorizedContract` allowlist, and Soroban forbids the escrow from
+    /// re-entering itself via the identity contract's `is_paused` guard.
+    /// The result is an incoherent combined state: delivery `Delivered`, escrow
+    /// `Refunded`, driver profile showing one extra completion — and
+    /// `get_combined_state` returning `is_synchronized = false` indefinitely.
+    ///
+    /// **What this function does.**
+    /// 1. Calls `escrow_contract::refund_escrow` with the admin as caller.
+    ///    If that fails (wrong state, insufficient balance, etc.) the
+    ///    transaction reverts and nothing here is committed.
+    /// 2. Transitions the delivery `Delivered → Cancelled` (the new
+    ///    state-machine edge added in Issue #110).
+    /// 3. If a driver is assigned and an identity contract is configured,
+    ///    decrements the driver's reputation by one point. This reverses the
+    ///    credit awarded by `confirm_delivery`. The admin is an authorized
+    ///    caller here (delivery_contract is on the allowlist); the escrow
+    ///    contract is not.
+    ///
+    /// After this call `get_combined_state` reports `(Cancelled, Refunded,
+    /// true)` — a coherent terminal state.
+    ///
+    /// **Authorization:** Admin only.
+    #[allow(deprecated)] // events().publish() is deprecated in SDK 27; see SOROBAN_SDK_27_MIGRATION.md
+    pub fn admin_refund_holdback(env: Env, admin: Address, delivery_id: DeliveryId) {
+        admin.require_auth();
+        if !is_admin(&env, &admin) {
+            panic_with_error!(&env, TrustchainError::Unauthorized);
+        }
+
+        let key = delivery_key(delivery_id);
+        let mut delivery: DeliveryRecord = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, TrustchainError::DeliveryNotFound));
+
+        // Guard: delivery must be in Delivered state. Any other state means
+        // the escrow is not in Holdback and this recovery path does not apply.
+        if delivery.status != DeliveryStatus::Delivered {
+            panic_with_error!(&env, TrustchainError::InvalidState);
+        }
+
+        let escrow_address: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::EscrowContract)
+            .unwrap_or_else(|| panic_with_error!(&env, TrustchainError::NotInitialized));
+
+        use soroban_sdk::IntoVal;
+
+        // ── 1. Refund the escrow (interaction before local state writes) ───
+        // The escrow contract validates that the escrow is in Holdback and
+        // that the caller is an admin; both conditions must hold. If either
+        // check fails the transaction reverts here and nothing below runs.
+        let _: () = env.invoke_contract(
+            &escrow_address,
+            &soroban_sdk::Symbol::new(&env, "refund_escrow"),
+            soroban_sdk::vec![
+                &env,
+                admin.into_val(&env),
+                u64::from(delivery_id).into_val(&env),
+            ],
+        );
+
+        // ── 2. Transition delivery Delivered → Cancelled ──────────────────
+        // validate_transition now permits Delivered → Cancelled for this path.
+        validate_transition(delivery.status, DeliveryStatus::Cancelled)
+            .unwrap_or_else(|_| panic_with_error!(&env, TrustchainError::InvalidState));
+
+        delivery.status = DeliveryStatus::Cancelled;
+        env.storage().persistent().set(&key, &delivery);
+        env.storage().persistent().extend_ttl(
+            &key,
+            ttl::LEDGER_TTL_THRESHOLD,
+            ttl::LEDGER_TTL_EXTEND_TO,
+        );
+
+        // ── 3. Reverse driver reputation ──────────────────────────────────
+        // Decrement by 1 to reverse the credit given at confirm_delivery.
+        // The delivery_contract IS on the identity contract's
+        // AuthorizedContract allowlist; the escrow contract is not, which is
+        // why this cannot be done from refund_escrow directly (Issue #468).
+        // We deliberately do not panic if the reputation call fails (e.g. the
+        // driver profile was deleted or the identity contract was rotated):
+        // the financial settlement and delivery-state correction already
+        // committed above are the primary invariants; reputation is secondary
+        // and should not undo a successful refund.
+        if let Some(driver_addr) = &delivery.driver {
+            if let Some(identity_contract) =
+                Self::get_identity_reputation_contract(env.clone())
+            {
+                let _result = env.try_invoke_contract::<(), soroban_sdk::Error>(
+                    &identity_contract,
+                    &Symbol::new(&env, "decrease_reputation"),
+                    soroban_sdk::vec![
+                        &env,
+                        env.current_contract_address().into_val(&env),
+                        driver_addr.into_val(&env),
+                        1u32.into_val(&env),
+                    ],
+                );
+            }
+        }
+
+        // ── 4. Emit event ──────────────────────────────────────────────────
+        env.events().publish(
+            (Symbol::new(&env, "holdback_admin_refunded"),),
+            (delivery_id, admin, delivery.sender),
+        );
     }
 
     /// Permissionless entry point that reclaims an expired escrow **and**

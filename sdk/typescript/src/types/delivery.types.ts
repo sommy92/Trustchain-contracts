@@ -37,6 +37,18 @@ export enum DeliveryErrorCode {
    * at a point where a funded escrow is a precondition (e.g. `mark_in_transit`).
    */
   EscrowNotLocked = 6,
+  /** `get_deliveries_page` was called with an unknown index kind. */
+  InvalidIndexKind = 7,
+  /**
+   * `confirm_delivery` found the escrow bound to a different driver, sender,
+   * or recipient than the delivery record.
+   */
+  EscrowPartyMismatch = 8,
+  /**
+   * `assign_driver` was called with no identity contract configured and the
+   * deployment has not opted into no-identity mode (`setIdentityOptional`).
+   */
+  IdentityNotConfigured = 9,
 }
 
 /**
@@ -49,8 +61,7 @@ export const DeliveryErrorCodes = {
   InvalidDriver: 4,
   InvalidParties: 5,
   EscrowNotLocked: 6,
-  NoPendingContractChange: 7,
-  ContractChangeTimelockNotElapsed: 8,
+  InvalidIndexKind: 7,
 } as const;
 
 export interface CreateDeliveryParams {
@@ -114,6 +125,26 @@ export interface UpdateDeliveryMetadataParams {
   sender: string;
   deliveryId: bigint;
   metadata: DeliveryMetadata;
+}
+
+/**
+ * Peer-only: `caller` must be the escrow contract configured on the delivery
+ * contract. `reporter` is the account recorded in the `delivery_disputed`
+ * event (the admin who froze the escrow).
+ */
+export interface SyncDisputeFromEscrowParams {
+  caller: string;
+  reporter: string;
+  deliveryId: bigint;
+}
+
+/**
+ * Peer-only: `caller` must be the dispute resolution contract configured on
+ * the delivery contract.
+ */
+export interface ResolveDeliveryDisputeParams {
+  caller: string;
+  deliveryId: bigint;
 }
 
 export interface GetDeliveryParams {
