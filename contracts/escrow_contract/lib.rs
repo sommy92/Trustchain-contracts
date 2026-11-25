@@ -384,6 +384,47 @@ fn get_holdback_window(env: &Env) -> u64 {
         .unwrap_or(constants::DEFAULT_HOLDBACK_WINDOW_SECONDS)
 }
 
+/// Query the configured dispute resolution contract for its dispute filing
+/// window (`get_dispute_time_limit`), if one is configured (Issue #112).
+///
+/// Returns `None` when no dispute contract is configured or the cross-contract
+/// call fails, so callers can fall back to the holdback window alone. A
+/// delivered dispute is admissible until `delivered_at + dispute_time_limit`,
+/// so the permissionless holdback release must not finalize funds before that
+/// deadline — otherwise a later `raise_dispute` would revert while trying to
+/// freeze an already-`Released` escrow.
+fn get_dispute_time_limit(env: &Env) -> Option<u64> {
+    let dispute_contract: Address = env
+        .storage()
+        .instance()
+        .get(&DataKey::DisputeResolutionContract)?;
+    let result = env.try_invoke_contract::<u64, soroban_sdk::Error>(
+        &dispute_contract,
+        &Symbol::new(env, "get_dispute_time_limit"),
+        soroban_sdk::vec![env],
+    );
+    match result {
+        Ok(Ok(limit)) => Some(limit),
+        _ => None,
+    }
+}
+
+/// Effective number of seconds an escrow must sit in `Holdback` before
+/// `release_expired_holdback` may settle it permissionlessly (Issue #112).
+///
+/// This is `max(holdback_window, dispute_time_limit)` so the advertised
+/// dispute deadline can never outlast irreversibly releasable funds. When no
+/// dispute contract is configured (or the query fails) the holdback window
+/// alone governs.
+fn get_effective_holdback_window(env: &Env) -> u64 {
+    let holdback_window = get_holdback_window(env);
+    match get_dispute_time_limit(env) {
+        Some(dispute_limit) => holdback_window.max(dispute_limit),
+        None => holdback_window,
+    }
+}
+=======
+
 /// Return the configured delivery contract address, if any.
 /// Used by `create_escrow` / `create_escrows_batch` to verify that a delivery
 /// record exists and matches the supplied parties (Issue #295).
@@ -1315,6 +1356,23 @@ impl EscrowContract {
     pub fn set_dispute_resolution_contract(env: Env, admin: Address, dispute_contract: Address) {
         admin.require_auth();
         require_admin(&env, &admin);
+        // Issue #112: reject a dispute contract whose filing window outlasts
+        // the configured holdback window, so the advertised dispute deadline
+        // can never promise a remedy after funds become irreversibly
+        // releasable via `release_expired_holdback`.
+        let dispute_limit = env
+            .try_invoke_contract::<u64, soroban_sdk::Error>(
+                &dispute_contract,
+                &Symbol::new(&env, "get_dispute_time_limit"),
+                soroban_sdk::vec![&env],
+            )
+            .ok()
+            .and_then(|r| r.ok());
+        if let Some(dispute_limit) = dispute_limit {
+            if get_holdback_window(&env) < dispute_limit {
+                panic_with_error!(&env, EscrowError::InvalidState);
+            }
+        }
         env.storage()
             .instance()
             .set(&DataKey::DisputeResolutionContract, &dispute_contract);
@@ -2437,6 +2495,15 @@ impl EscrowContract {
             || new_window_seconds > constants::MAX_HOLDBACK_WINDOW_SECONDS
         {
             panic_with_error!(&env, TrustchainError::InvalidState);
+        }
+        // Issue #112: a holdback window shorter than the configured dispute
+        // filing window would let `release_expired_holdback` finalize funds
+        // while a dispute is still admissible, so a later `raise_dispute`
+        // would revert trying to freeze a Released escrow. Reject it.
+        if let Some(dispute_limit) = get_dispute_time_limit(&env) {
+            if new_window_seconds < dispute_limit {
+                panic_with_error!(&env, EscrowError::InvalidState);
+            }
         }
         env.storage()
             .instance()

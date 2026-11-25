@@ -331,6 +331,133 @@ fn test_admin_whitelist_management() {
     assert!(dispute_client.is_admin(&new_admin));
 }
 
+/// Issue #115: a pending roster approval must expire. A proposal made under an
+/// old governance context cannot be completed much later by another admin.
+#[test]
+fn test_expired_admin_add_approval_cannot_complete_roster_change() {
+    let (env, admin, _, _, _, _, _, dispute_client) = setup_test();
+    let second_admin = Address::generate(&env);
+    bootstrap_admin(&dispute_client, &admin, &second_admin);
+
+    let nominee = Address::generate(&env);
+    dispute_client.add_admin(&admin, &nominee);
+    assert!(!dispute_client.is_admin(&nominee));
+
+    // Advance past the approval validity window.
+    env.ledger().set_timestamp(
+        env.ledger().timestamp() + shared_types::ADMIN_APPROVAL_VALIDITY_SECONDS + 1,
+    );
+
+    // The stale approval no longer counts; the nominee is not added.
+    let result = dispute_client.try_add_admin(&second_admin, &nominee);
+    match result {
+        Err(Ok(err)) => assert_eq!(err, TrustchainError::InvalidState.into()),
+        other => panic!("expected InvalidState for an expired approval, got {other:?}"),
+    }
+    assert!(!dispute_client.is_admin(&nominee));
+}
+
+/// Issue #115: a pending roster approval must be explicitly withdrawable.
+#[test]
+fn test_cancelled_admin_add_approval_cannot_complete_roster_change() {
+    let (env, admin, _, _, _, _, _, dispute_client) = setup_test();
+    let second_admin = Address::generate(&env);
+    bootstrap_admin(&dispute_client, &admin, &second_admin);
+
+    let nominee = Address::generate(&env);
+    dispute_client.add_admin(&admin, &nominee);
+    dispute_client.cancel_pending_admin_add(&admin, &nominee);
+
+    let result = dispute_client.try_add_admin(&second_admin, &nominee);
+    match result {
+        Err(Ok(err)) => assert_eq!(err, TrustchainError::InvalidState.into()),
+        other => panic!("expected InvalidState for a cancelled approval, got {other:?}"),
+    }
+    assert!(!dispute_client.is_admin(&nominee));
+}
+
+/// Issue #115: the same expiry/cancellation rules apply to removals.
+#[test]
+fn test_expired_admin_remove_approval_cannot_complete_roster_change() {
+    let (env, admin, _, _, _, _, _, dispute_client) = setup_test();
+    let second_admin = Address::generate(&env);
+    let third_admin = Address::generate(&env);
+    bootstrap_admin(&dispute_client, &admin, &second_admin);
+    approve_admin_add(&dispute_client, &admin, &second_admin, &third_admin);
+
+    dispute_client.remove_admin(&admin, &third_admin);
+    env.ledger().set_timestamp(
+        env.ledger().timestamp() + shared_types::ADMIN_APPROVAL_VALIDITY_SECONDS + 1,
+    );
+
+    let result = dispute_client.try_remove_admin(&second_admin, &third_admin);
+    match result {
+        Err(Ok(err)) => assert_eq!(err, TrustchainError::InvalidState.into()),
+        other => panic!("expected InvalidState for an expired removal approval, got {other:?}"),
+    }
+    assert!(dispute_client.is_admin(&third_admin));
+}
+
+/// Issue #115: a pending removal approval can be withdrawn.
+#[test]
+fn test_cancelled_admin_remove_approval_cannot_complete_roster_change() {
+    let (env, admin, _, _, _, _, _, dispute_client) = setup_test();
+    let second_admin = Address::generate(&env);
+    let third_admin = Address::generate(&env);
+    bootstrap_admin(&dispute_client, &admin, &second_admin);
+    approve_admin_add(&dispute_client, &admin, &second_admin, &third_admin);
+
+    dispute_client.remove_admin(&admin, &third_admin);
+    dispute_client.cancel_pending_admin_remove(&admin, &third_admin);
+
+    let result = dispute_client.try_remove_admin(&second_admin, &third_admin);
+    match result {
+        Err(Ok(err)) => assert_eq!(err, TrustchainError::InvalidState.into()),
+        other => panic!("expected InvalidState for a cancelled removal approval, got {other:?}"),
+    }
+    assert!(dispute_client.is_admin(&third_admin));
+}
+
+/// Issue #116: successful roster mutations must renew the instance TTL so a
+/// governance-only deployment does not approach archival.
+#[test]
+fn test_admin_roster_mutations_extend_instance_ttl() {
+    let (env, admin, _, _, _, _, _, dispute_client) = setup_test();
+    let dispute_id = dispute_client.address.clone();
+
+    let second_admin = Address::generate(&env);
+    env.ledger().with_mut(|ledger| {
+        ledger.sequence_number += ttl::LEDGER_TTL_EXTEND_TO - 10;
+    });
+    dispute_client.add_admin(&admin, &second_admin);
+    let remaining_ttl = env.deployer().get_contract_instance_ttl(&dispute_id);
+    assert!(
+        remaining_ttl >= ttl::LEDGER_TTL_THRESHOLD,
+        "add_admin must extend instance TTL (got {remaining_ttl})"
+    );
+
+    env.ledger().with_mut(|ledger| {
+        ledger.sequence_number += ttl::LEDGER_TTL_EXTEND_TO - 10;
+    });
+    dispute_client.accept_admin(&second_admin);
+    let remaining_ttl = env.deployer().get_contract_instance_ttl(&dispute_id);
+    assert!(
+        remaining_ttl >= ttl::LEDGER_TTL_THRESHOLD,
+        "accept_admin must extend instance TTL (got {remaining_ttl})"
+    );
+
+    env.ledger().with_mut(|ledger| {
+        ledger.sequence_number += ttl::LEDGER_TTL_EXTEND_TO - 10;
+    });
+    approve_admin_removal(&dispute_client, &admin, &second_admin, &second_admin);
+    let remaining_ttl = env.deployer().get_contract_instance_ttl(&dispute_id);
+    assert!(
+        remaining_ttl >= ttl::LEDGER_TTL_THRESHOLD,
+        "remove_admin must extend instance TTL (got {remaining_ttl})"
+    );
+    assert!(!dispute_client.is_admin(&second_admin));
+}
+
 #[test]
 fn test_admin_roster_changes_require_distinct_approvals() {
     let (env, admin, _, _, _, _, _, dispute_client) = setup_test();
@@ -1747,6 +1874,67 @@ fn test_dispute_split_penalty_configurable() {
 
     dispute_client.set_dispute_split_penalty(&admin, &15);
     assert_eq!(dispute_client.get_dispute_split_penalty(), 15);
+}
+
+/// Issue #113: the automatic 50/50 outcome produced by `force_resolve_dispute`
+/// must apply the same configured split penalty as the mediated split path.
+#[test]
+fn test_force_resolve_dispute_applies_configured_split_penalty() {
+    use identity_reputation_contract::{
+        IdentityReputationContract, IdentityReputationContractClient,
+    };
+
+    let (env, admin, sender, recipient, driver, delivery_id, escrow_id, dispute_client) =
+        setup_test();
+
+    let identity_id = env.register(IdentityReputationContract, ());
+    let identity_client = IdentityReputationContractClient::new(&env, &identity_id);
+    identity_client.init(&admin, &delivery_id, &dispute_client.address);
+    dispute_client.set_identity_reputation_contract(&admin, &identity_id);
+    identity_client.register_driver(&driver);
+    assert_eq!(
+        identity_client.get_driver_profile(&driver).reputation_score,
+        50
+    );
+
+    // Admin policy update: split penalty is no longer the default 5.
+    dispute_client.set_dispute_split_penalty(&admin, &15);
+
+    let mut delivery_record = create_mock_delivery_record(
+        &env,
+        did(30),
+        sender.clone(),
+        recipient.clone(),
+        DeliveryStatus::Active,
+        None,
+    );
+    delivery_record.driver = Some(driver.clone());
+    set_mock_delivery(&env, &delivery_id, did(30), &delivery_record);
+
+    let escrow_record = create_mock_escrow_record(
+        sender.clone(),
+        recipient.clone(),
+        driver.clone(),
+        Address::generate(&env),
+        shared_types::EscrowStatus::Locked,
+    );
+    set_mock_escrow(&env, &escrow_id, 30, &escrow_record);
+
+    let raised_at = env.ledger().timestamp();
+    dispute_client.raise_dispute(&sender, &did(30));
+    env.ledger().set_timestamp(raised_at + 604800 + 1);
+
+    dispute_client.force_resolve_dispute(&recipient, &did(30));
+    assert_eq!(
+        dispute_client.get_dispute(&did(30)).status,
+        DisputeStatus::Split
+    );
+
+    // 50 − 15 (configured), not 50 − 5 (the old hardcoded default).
+    assert_eq!(
+        identity_client.get_driver_profile(&driver).reputation_score,
+        35
+    );
 }
 
 #[test]

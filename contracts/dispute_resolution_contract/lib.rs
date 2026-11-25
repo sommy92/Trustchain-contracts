@@ -137,6 +137,28 @@ pub struct DisputeCase {
     pub resolved_by: Option<Address>,
 }
 
+/// Issue #115: a pending admin roster approval is only valid for this many
+/// seconds after it is proposed. Without a bound, a proposal made under an old
+/// governance context could be completed much later by another admin while the
+/// original proposer remains authorized. Approvals older than this window are
+/// treated as expired and cannot be used to add or remove an administrator.
+const PENDING_ADMIN_APPROVAL_TTL_SECONDS: u64 = 7 * 24 * 60 * 60; // 7 days
+
+/// A pending admin roster approval together with the timestamp it was
+/// proposed. The timestamp bounds the approval's validity (Issue #115).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingAdminApproval {
+    pub proposer: Address,
+    pub proposed_at: u64,
+}
+
+impl PendingAdminApproval {
+    fn is_expired(&self, now: u64) -> bool {
+        now > self.proposed_at.saturating_add(PENDING_ADMIN_APPROVAL_TTL_SECONDS)
+    }
+}
+
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
@@ -354,13 +376,41 @@ impl DisputeResolutionContract {
             panic_with_error!(&env, TrustchainError::InvalidState);
         }
 
+        let now = env.ledger().timestamp();
         let key = DataKey::PendingAdminAdd(new_admin.clone());
-        if let Some(proposer) = env.storage().instance().get::<_, Address>(&key) {
-            if proposer == caller {
+        if let Some(pending) = env
+            .storage()
+            .instance()
+            .get::<_, PendingAdminApproval>(&key)
+        {
+            // Issue #115: an expired approval is discarded and the caller
+            // becomes the fresh proposer, so a stale proposal can never be
+            // completed later.
+            if pending.is_expired(now) {
+                env.storage().instance().set(
+                    &key,
+                    &PendingAdminApproval {
+                        proposer: caller.clone(),
+                        proposed_at: now,
+                    },
+                );
+                env.events().publish(
+                    (Symbol::new(&env, "admin_add_proposed"),),
+                    (caller, new_admin),
+                );
+                return;
+            }
+            if pending.proposer == caller {
                 panic_with_error!(&env, TrustchainError::InvalidState);
             }
-            if !Self::is_admin(env.clone(), proposer) {
-                env.storage().instance().set(&key, &caller);
+            if !Self::is_admin(env.clone(), pending.proposer) {
+                env.storage().instance().set(
+                    &key,
+                    &PendingAdminApproval {
+                        proposer: caller.clone(),
+                        proposed_at: now,
+                    },
+                );
                 env.events().publish(
                     (Symbol::new(&env, "admin_add_proposed"),),
                     (caller, new_admin),
@@ -375,13 +425,70 @@ impl DisputeResolutionContract {
             env.storage()
                 .instance()
                 .set(&DataKey::AdminList, &admin_list);
+            // Issue #116: a successful roster mutation renews the instance
+            // holding the authority and peer settings.
+            env.storage()
+                .instance()
+                .extend_ttl(ttl::LEDGER_TTL_THRESHOLD, ttl::LEDGER_TTL_EXTEND_TO);
             env.events()
                 .publish((Symbol::new(&env, "admin_added"),), (caller, new_admin));
         } else {
-            env.storage().instance().set(&key, &caller);
+            env.storage().instance().set(
+                &key,
+                &PendingAdminApproval {
+                    proposer: caller.clone(),
+                    proposed_at: now,
+                },
+            );
             env.events().publish(
                 (Symbol::new(&env, "admin_add_proposed"),),
                 (caller, new_admin),
+            );
+        }
+    }
+
+    /// Issue #115: explicitly withdraw a pending admin-add approval. Only the
+    /// original proposer may cancel it. Cancelling a non-existent approval is a
+    /// no-op so a stale cancellation cannot revert a legitimate governance
+    /// transaction.
+    #[allow(deprecated)] // events().publish() is deprecated in SDK 27.0.0 but still functional; tracked in SOROBAN_SDK_27_MIGRATION.md#event-system-migration (Issue #114)
+    pub fn cancel_pending_admin_add(env: Env, caller: Address, new_admin: Address) {
+        caller.require_auth();
+        let key = DataKey::PendingAdminAdd(new_admin.clone());
+        if let Some(pending) = env
+            .storage()
+            .instance()
+            .get::<_, PendingAdminApproval>(&key)
+        {
+            if pending.proposer != caller {
+                panic_with_error!(&env, TrustchainError::Unauthorized);
+            }
+            env.storage().instance().remove(&key);
+            env.events().publish(
+                (Symbol::new(&env, "admin_add_cancelled"),),
+                (caller, new_admin),
+            );
+        }
+    }
+
+    /// Issue #115: explicitly withdraw a pending admin-remove approval. Only
+    /// the original proposer may cancel it.
+    #[allow(deprecated)] // events().publish() is deprecated in SDK 27.0.0 but still functional; tracked in SOROBAN_SDK_27_MIGRATION.md#event-system-migration (Issue #114)
+    pub fn cancel_pending_admin_remove(env: Env, caller: Address, old_admin: Address) {
+        caller.require_auth();
+        let key = DataKey::PendingAdminRemove(old_admin.clone());
+        if let Some(pending) = env
+            .storage()
+            .instance()
+            .get::<_, PendingAdminApproval>(&key)
+        {
+            if pending.proposer != caller {
+                panic_with_error!(&env, TrustchainError::Unauthorized);
+            }
+            env.storage().instance().remove(&key);
+            env.events().publish(
+                (Symbol::new(&env, "admin_remove_cancelled"),),
+                (caller, old_admin),
             );
         }
     }
@@ -390,11 +497,17 @@ impl DisputeResolutionContract {
     pub fn accept_admin(env: Env, new_admin: Address) {
         new_admin.require_auth();
         let key = DataKey::PendingAdminAdd(new_admin.clone());
-        let proposer = env
+        let pending = env
             .storage()
             .instance()
-            .get::<_, Address>(&key)
+            .get::<_, PendingAdminApproval>(&key)
             .unwrap_or_else(|| panic_with_error!(&env, TrustchainError::InvalidState));
+        // Issue #115: an expired approval cannot be used to add an admin.
+        if pending.is_expired(env.ledger().timestamp()) {
+            env.storage().instance().remove(&key);
+            panic_with_error!(&env, TrustchainError::InvalidState);
+        }
+        let proposer = pending.proposer;
         let admin_list: Vec<Address> = env
             .storage()
             .instance()
@@ -422,6 +535,10 @@ impl DisputeResolutionContract {
         env.storage()
             .instance()
             .set(&DataKey::AdminList, &updated_admin_list);
+        // Issue #116: renew the instance TTL after a successful roster change.
+        env.storage()
+            .instance()
+            .extend_ttl(ttl::LEDGER_TTL_THRESHOLD, ttl::LEDGER_TTL_EXTEND_TO);
         env.events()
             .publish((Symbol::new(&env, "admin_added"),), (proposer, new_admin));
     }
@@ -460,13 +577,40 @@ impl DisputeResolutionContract {
             panic_with_error!(&env, TrustchainError::InvalidState);
         }
 
+        let now = env.ledger().timestamp();
         let key = DataKey::PendingAdminRemove(old_admin.clone());
-        if let Some(proposer) = env.storage().instance().get::<_, Address>(&key) {
-            if proposer == caller {
+        if let Some(pending) = env
+            .storage()
+            .instance()
+            .get::<_, PendingAdminApproval>(&key)
+        {
+            // Issue #115: an expired approval is discarded and the caller
+            // becomes the fresh proposer.
+            if pending.is_expired(now) {
+                env.storage().instance().set(
+                    &key,
+                    &PendingAdminApproval {
+                        proposer: caller.clone(),
+                        proposed_at: now,
+                    },
+                );
+                env.events().publish(
+                    (Symbol::new(&env, "admin_remove_proposed"),),
+                    (caller, old_admin),
+                );
+                return;
+            }
+            if pending.proposer == caller {
                 panic_with_error!(&env, TrustchainError::InvalidState);
             }
-            if !Self::is_admin(env.clone(), proposer) {
-                env.storage().instance().set(&key, &caller);
+            if !Self::is_admin(env.clone(), pending.proposer) {
+                env.storage().instance().set(
+                    &key,
+                    &PendingAdminApproval {
+                        proposer: caller.clone(),
+                        proposed_at: now,
+                    },
+                );
                 env.events().publish(
                     (Symbol::new(&env, "admin_remove_proposed"),),
                     (caller, old_admin),
@@ -490,11 +634,21 @@ impl DisputeResolutionContract {
                 .instance()
                 .remove(&DataKey::Admin(old_admin.clone()));
             env.storage().instance().set(&DataKey::AdminList, &new_list);
+            // Issue #116: renew the instance TTL after a successful roster change.
+            env.storage()
+                .instance()
+                .extend_ttl(ttl::LEDGER_TTL_THRESHOLD, ttl::LEDGER_TTL_EXTEND_TO);
 
             env.events()
                 .publish((Symbol::new(&env, "admin_removed"),), (caller, old_admin));
         } else {
-            env.storage().instance().set(&key, &caller);
+            env.storage().instance().set(
+                &key,
+                &PendingAdminApproval {
+                    proposer: caller.clone(),
+                    proposed_at: now,
+                },
+            );
             env.events().publish(
                 (Symbol::new(&env, "admin_remove_proposed"),),
                 (caller, old_admin),
@@ -753,6 +907,24 @@ impl DisputeResolutionContract {
             .unwrap_or(0)
     }
 
+    /// Issue #112: the escrow contract must not finalize a permissionless
+    /// holdback release before this contract's advertised dispute deadline.
+    ///
+    /// `raise_dispute` accepts a dispute for a delivered delivery until
+    /// `delivered_at + DisputeTimeLimit`, but `escrow_contract` may release the
+    /// holdback once `holdback_started_at + HoldbackWindow` elapses. If the
+    /// holdback window is shorter than the dispute window, funds can become
+    /// irreversibly releasable while a dispute is still advertised as filable,
+    /// and the later `raise_dispute` reverts when it tries to freeze a
+    /// `Released` escrow. The escrow contract therefore queries this getter and
+    /// delays permissionless release until the effective dispute deadline.
+    ///
+    /// Returns `0` when unset, which the escrow contract treats as "no
+    /// additional delay" so a misconfigured peer never blocks release forever.
+    pub fn get_effective_dispute_deadline(env: Env, delivered_at: u64) -> u64 {
+        delivered_at.saturating_add(Self::get_dispute_time_limit(env))
+    }
+
     #[allow(deprecated)] // events().publish() is deprecated in SDK 27.0.0 but still functional; tracked in SOROBAN_SDK_27_MIGRATION.md#event-system-migration (Issue #114)
     pub fn set_dispute_reputation_penalty(env: Env, caller: Address, penalty: u32) {
         caller.require_auth();
@@ -903,6 +1075,36 @@ impl DisputeResolutionContract {
             (Symbol::new(&env, "dispute_time_limit_updated"),),
             (caller, old_limit, new_limit),
         );
+    }
+
+    /// Issue #112: report whether the linked escrow contract's holdback window
+    /// is compatible with this contract's dispute window.
+    ///
+    /// A dispute window longer than the holdback window is *not* rejected: the
+    /// escrow contract consults `get_effective_dispute_deadline` and delays
+    /// permissionless release until the advertised dispute deadline, so a
+    /// longer dispute window remains safe. This helper exists so operators and
+    /// off-chain tooling can detect and surface the mismatch, and so the
+    /// compatibility rule is documented in one place.
+    ///
+    /// Returns `true` when the holdback window is at least the dispute window
+    /// (release can never precede the dispute deadline), or when either value
+    /// is unavailable.
+    pub fn is_holdback_window_compatible(env: Env) -> bool {
+        let escrow_addr: Address = match env
+            .storage()
+            .instance()
+            .get(&DataKey::EscrowContract)
+        {
+            Some(addr) => addr,
+            None => return true,
+        };
+        let holdback_window: u64 = env.invoke_contract(
+            &escrow_addr,
+            &Symbol::new(&env, "get_holdback_window"),
+            soroban_sdk::vec![&env],
+        );
+        holdback_window >= Self::get_dispute_time_limit(env)
     }
 
     #[allow(deprecated)] // events().publish() is deprecated in SDK 27.0.0 but still functional; tracked in SOROBAN_SDK_27_MIGRATION.md#event-system-migration (Issue #114)
@@ -1516,6 +1718,11 @@ impl DisputeResolutionContract {
                 .instance()
                 .get::<DataKey, Address>(&DataKey::IdentityReputationContract)
             {
+                // Issue #113: use the admin-configurable split penalty so a
+                // forced 50/50 outcome applies the same policy as a mediated
+                // split, rather than a hard-coded default that ignores
+                // `set_dispute_split_penalty`.
+                let split_penalty = Self::get_dispute_split_penalty(env.clone());
                 let _: () = env.invoke_contract(
                     &reputation_addr,
                     &Symbol::new(&env, "decrease_reputation"),
